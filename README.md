@@ -6,6 +6,7 @@ of ES8388 audio codec on RK3588 platform using Linux ASoC.
 ## Current Status
 
 Phase0: Power + I2C + Regmap ✔
+
 Phase1: ASoC component + DAI registered ✔
 
 - Regulator bring-up
