@@ -1,0 +1,12 @@
+/* ES8388 codec node */
+
+es8388: es8388@10 {
+    compatible = "tom,es8388";
+    reg = <0x10>;
+
+    DVDD-supply = <&vcc_1v8_s0>;
+    PVDD-supply = <&vcc_1v8_s0>;
+    AVDD-supply = <&vcc_3v3_s0>;
+    HPVDD-supply = <&vcc_3v3_s0>;
+};
+
