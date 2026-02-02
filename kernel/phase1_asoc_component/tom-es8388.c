@@ -85,13 +85,18 @@ static const struct snd_soc_dapm_widget es8388_dapm_widgets[] = {
     SND_SOC_DAPM_OUTPUT("ROUT2"),
 };
 
+static const struct snd_soc_dapm_route es8388_routes[] = {
+    { "LOUT1", NULL, "Playback" },
+    { "ROUT1", NULL, "Playback" },
+};
 
 static const struct snd_soc_component_driver es8388_component_driver = {
         .name = "tom-es8388",
         .probe = es8388_component_probe,
         .dapm_widgets     = es8388_dapm_widgets,
         .num_dapm_widgets = ARRAY_SIZE(es8388_dapm_widgets),
-
+        .dapm_routes     = es8388_routes,
+        .num_dapm_routes = ARRAY_SIZE(es8388_routes),
 };
 
 static int es8388_power_on(struct device *dev, struct es8388_priv *priv)
