@@ -48,12 +48,36 @@ static struct snd_soc_dai_driver es8388_dai = {
 
 static int es8388_component_probe(struct snd_soc_component *component)
 {
-        struct es8388_priv *es8388;
+	struct device *dev = component->dev;
+	struct es8388_priv *priv, *priv_check;
 
-        es8388 = snd_soc_component_get_drvdata(component);
+	pr_info("ES8388: component_probe entered\n");
+
+	priv = dev_get_drvdata(dev);
+	if (!priv) {
+		dev_err(dev, "component probe: dev_get_drvdata() returned NULL\n");
+		return -EINVAL;
+	}
+	if (!priv->regmap) {
+		dev_err(dev, "component probe: priv->regmap is NULL\n");
+		return -EINVAL;
+	}
+
+	snd_soc_component_set_drvdata(component, priv);
+
+	priv_check = snd_soc_component_get_drvdata(component);
+	if (priv_check != priv) {
+		dev_err(dev, "component probe: drvdata mismatch priv=%p priv_check=%p\n",
+			priv, priv_check);
+		return -EINVAL;
+	}
+
+	dev_info(dev, "es8388 component probe ok priv=%p regmap=%p\n",
+		 priv, priv->regmap);
 
 	return 0;
 }
+
 
 static const struct snd_soc_component_driver es8388_component_driver = {
         .name = "tom-es8388",
@@ -114,6 +138,8 @@ static int es8388_probe_core(struct device *dev, struct es8388_priv *priv)
                 else
                         dev_info(dev, "regmap_read sanity ok: reg0x00=0x%02x\n  ", val);
         }
+
+        dev_set_drvdata(dev, priv);
 
         return devm_snd_soc_register_component(dev,
                 &es8388_component_driver, &es8388_dai, 1);
