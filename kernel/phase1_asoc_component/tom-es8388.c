@@ -78,10 +78,20 @@ static int es8388_component_probe(struct snd_soc_component *component)
 	return 0;
 }
 
+static const struct snd_soc_dapm_widget es8388_dapm_widgets[] = {
+    SND_SOC_DAPM_OUTPUT("LOUT1"),
+    SND_SOC_DAPM_OUTPUT("ROUT1"),
+    SND_SOC_DAPM_OUTPUT("LOUT2"),
+    SND_SOC_DAPM_OUTPUT("ROUT2"),
+};
+
 
 static const struct snd_soc_component_driver es8388_component_driver = {
         .name = "tom-es8388",
-        .probe = es8388_component_probe,    
+        .probe = es8388_component_probe,
+        .dapm_widgets     = es8388_dapm_widgets,
+        .num_dapm_widgets = ARRAY_SIZE(es8388_dapm_widgets),
+
 };
 
 static int es8388_power_on(struct device *dev, struct es8388_priv *priv)
