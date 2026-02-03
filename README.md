@@ -9,6 +9,8 @@ Phase0: Power + I2C + Regmap ✔
 
 Phase1: ASoC component + DAI registered ✔
 
+Phase2: Bias level bring-up (set_bias_level) ✔
+
 - Regulator bring-up
 - I2C communication verified
 - Regmap initialized
