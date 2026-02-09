@@ -106,6 +106,16 @@
 /* R19: DAC Control 3 */
 #define ES8388_DACCONTROL3		0x19
 #define ES8388_DACCONTROL3_DACMUTE	(1 << 2)
+#define ES8388_DACCONTROL3_RAMPRATE_MASK   (3 << 6)
+#define ES8388_DACCONTROL3_RAMPRATE_4LRCK  (0 << 6)
+#define ES8388_DACCONTROL3_RAMPRATE_32LRCK (1 << 6)
+#define ES8388_DACCONTROL3_RAMPRATE_64LRCK (2 << 6)
+#define ES8388_DACCONTROL3_RAMPRATE_128LRCK (3 << 6)
+#define ES8388_DACCONTROL3_DACSOFTRAMP     (1 << 5)
+
+/* R28: DAC Control 6 */
+#define ES8388_DACCONTROL6             0x1C
+#define ES8388_DACCONTROL6_CLICKFREE   (1 << 3)
 
 /* DAC Digital Volume */
 #define ES8388_LDACVOL			0x1A
@@ -145,13 +155,15 @@ struct es8388_priv {
  * values that DAPM/kcontrol have already set to a different state.
  */
 static const struct reg_default es8388_reg_defaults[] = {
-	{ 0x00, 0x06 },  /* CONTROL1: VMIDSEL=500k, EnRef */
+	{ 0x00, 0x05 },  /* CONTROL1: VMIDSEL=500k, EnRef */
 	{ 0x01, 0xC0 },  /* CONTROL2: overcurrent + thermal shutdown */
 	{ 0x02, 0x00 },  /* CHIPPOWER: all powered on */
 	{ 0x04, 0xC0 },  /* DACPOWER: DAC off, outputs off (DAPM controls) */
 	{ 0x17, 0x18 },  /* DACCONTROL1: I2S, 16-bit */
 	{ 0x18, 0x02 },  /* DACCONTROL2: MCLK/LRCK = 256 */
-	{ 0x19, 0x22 },  /* DACCONTROL3: soft ramp on, mute off */
+        { 0x2D, 0x10 },  /* DACCONTROL23: VROI=40k (slow discharge = no stop pop) */
+        { ES8388_DACCONTROL3, 0x22 | ES8388_DACCONTROL3_RAMPRATE_128LRCK },
+        { ES8388_DACCONTROL6, ES8388_DACCONTROL6_CLICKFREE }, /* 0x08 */
 };
 
 static const struct regmap_config es8388_regmap_config = {
@@ -192,6 +204,71 @@ static const struct snd_kcontrol_new es8388_snd_controls[] = {
 			 ES8388_LOUT1VOL, ES8388_ROUT1VOL,
 			 0, ES8388_OUT1VOL_MAX, 0, out_tlv),
 };
+
+/*
+ * Output PGA DAPM event handler for pop-noise suppression.
+ *
+ * This callback is used to mute/unmute the DAC at proper timing
+ * when the output amplifier is powered on/off by DAPM.
+ *
+ * Power-up sequence (PRE_PMU -> POST_PMU):
+ *
+ *   1. PRE_PMU:
+ *      Mute DAC before enabling output stage.
+ *      This prevents unstable analog bias / VMID charging noise
+ *      from being amplified by the output PGA.
+ *
+ *   2. POST_PMU:
+ *      Wait for analog circuits (DAC, VMID, output driver)
+ *      to settle after power-up.
+ *      Then unmute DAC to start playback cleanly.
+ *
+ * Power-down sequence (PRE_PMD):
+ *
+ *   3. PRE_PMD:
+ *      Mute DAC before disabling output stage.
+ *      This avoids pop/click caused by sudden discharge of
+ *      output capacitors and bias collapse.
+ *
+ * Overall goal:
+ *   Ensure that audio signal is always muted during
+ *   unstable analog power transitions, so that
+ *   power on/off does not generate audible pop noise.
+ */
+
+static int es8388_out1_pga_event(struct snd_soc_dapm_widget *w,
+                                 struct snd_kcontrol *kcontrol,
+                                 int event)
+{
+    struct snd_soc_component *c = snd_soc_dapm_to_component(w->dapm);
+
+    switch (event) {
+    case SND_SOC_DAPM_PRE_PMU:
+        /* Mute DAC before output amplifier turns on */
+        snd_soc_component_update_bits(c, ES8388_DACCONTROL3,
+                                      ES8388_DACCONTROL3_DACMUTE,
+                                      ES8388_DACCONTROL3_DACMUTE);
+        break;
+
+    case SND_SOC_DAPM_POST_PMU:
+        /* Wait longer to ensure VMID bias is fully stable on the decoupling capacitors */
+        msleep(150);
+        snd_soc_component_update_bits(c, ES8388_DACCONTROL3,
+                                      ES8388_DACCONTROL3_DACMUTE, 0);
+        break;
+
+    case SND_SOC_DAPM_PRE_PMD:
+         /* Ensure enough time for Digital Soft Ramp to finish before cutting analog power */
+        snd_soc_component_update_bits(c, ES8388_DACCONTROL3,
+                                      ES8388_DACCONTROL3_DACMUTE,
+                                      ES8388_DACCONTROL3_DACMUTE);
+        msleep(50);
+        break;
+    }
+
+    return 0;
+}
+
 
 /* ========== DAPM (Dynamic Audio Power Management) ========== */
 
@@ -241,10 +318,22 @@ static const struct snd_soc_dapm_widget es8388_dapm_widgets[] = {
 			   es8388_right_mixer, ARRAY_SIZE(es8388_right_mixer)),
 
 	/* R04[5:4]: Output amplifier power */
-	SND_SOC_DAPM_PGA("Left Out 1", ES8388_DACPOWER,
-			 ES8388_DACPOWER_LOUT1_ON, 0, NULL, 0),
-	SND_SOC_DAPM_PGA("Right Out 1", ES8388_DACPOWER,
-			 ES8388_DACPOWER_ROUT1_ON, 0, NULL, 0),
+	//SND_SOC_DAPM_PGA("Left Out 1", ES8388_DACPOWER,
+	//		 ES8388_DACPOWER_LOUT1_ON, 0, NULL, 0),
+	//SND_SOC_DAPM_PGA("Right Out 1", ES8388_DACPOWER,
+	//		 ES8388_DACPOWER_ROUT1_ON, 0, NULL, 0),
+        SND_SOC_DAPM_PGA_E("Left Out 1", ES8388_DACPOWER,
+                           ES8388_DACPOWER_LOUT1_ON, 0, NULL, 0,
+                           es8388_out1_pga_event,
+                           SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
+                           SND_SOC_DAPM_PRE_PMD),
+
+        SND_SOC_DAPM_PGA_E("Right Out 1", ES8388_DACPOWER,
+                           ES8388_DACPOWER_ROUT1_ON, 0, NULL, 0,
+                           es8388_out1_pga_event,
+                           SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
+                           SND_SOC_DAPM_PRE_PMD),
+
 
 	/* Physical output pins */
 	SND_SOC_DAPM_OUTPUT("LOUT1"),
@@ -354,9 +443,12 @@ static int tom_es8388_hw_params(struct snd_pcm_substream *substream,
 
 static int tom_es8388_mute(struct snd_soc_dai *dai, int mute, int direction)
 {
-	return snd_soc_component_update_bits(dai->component, ES8388_DACCONTROL3,
-					     ES8388_DACCONTROL3_DACMUTE,
-					     mute ? ES8388_DACCONTROL3_DACMUTE : 0);
+    if (direction != SNDRV_PCM_STREAM_PLAYBACK)
+        return 0;
+
+    return snd_soc_component_update_bits(dai->component, ES8388_DACCONTROL3,
+                                         ES8388_DACCONTROL3_DACMUTE,
+                                         mute ? ES8388_DACCONTROL3_DACMUTE : 0);
 }
 
 static const struct snd_soc_dai_ops tom_es8388_dai_ops = {
@@ -400,6 +492,8 @@ static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 {
 	switch (level) {
 	case SND_SOC_BIAS_ON:
+                /* Playback state: Set VROI to 1.5k Ohm for proper output driving capability */
+                snd_soc_component_update_bits(component, 0x2D, 0x10, 0);
 		break;
 
 	case SND_SOC_BIAS_PREPARE:
@@ -414,6 +508,9 @@ static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 				ES8388_CONTROL1_ENREF,
 				ES8388_CONTROL1_VMIDSEL_50k |
 				ES8388_CONTROL1_ENREF);
+
+                /* Standby state: Set VROI to 40k Ohm high impedance to prevent pop noise from rapid discharge */
+                snd_soc_component_update_bits(component, 0x2D, 0x10, 0x10);
 		break;
 
 	case SND_SOC_BIAS_STANDBY:
@@ -425,7 +522,7 @@ static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 					ES8388_CONTROL1_ENREF,
 					ES8388_CONTROL1_VMIDSEL_5k |
 					ES8388_CONTROL1_ENREF);
-			msleep(100);
+			msleep(50);
 		}
 
 		/* R01: Enable overcurrent + thermal protection */
@@ -433,20 +530,27 @@ static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 				ES8388_CONTROL2_OVERCURRENT |
 				ES8388_CONTROL2_THERMAL);
 
-		/* R00: VMID=500k (low power standby), keep reference on */
+		/* R00: VMID=50k (low power standby), keep reference on */
 		snd_soc_component_update_bits(component, ES8388_CONTROL1,
 				ES8388_CONTROL1_VMIDSEL_MASK |
 				ES8388_CONTROL1_ENREF,
-				ES8388_CONTROL1_VMIDSEL_500k |
+				ES8388_CONTROL1_VMIDSEL_50k |
 				ES8388_CONTROL1_ENREF);
 		break;
 
 	case SND_SOC_BIAS_OFF:
 		/* Disable VMID and reference entirely */
+                /* Let DAC fully settle before power-down */
+                msleep(50);
+
+                /* Turn off DAC + output amp */
+                snd_soc_component_write(component, ES8388_DACPOWER, 0xC0);
+
+                /* Disable VMID and reference */
 		snd_soc_component_update_bits(component, ES8388_CONTROL1,
-				ES8388_CONTROL1_VMIDSEL_MASK |
-				ES8388_CONTROL1_ENREF,
-				0);
+				              ES8388_CONTROL1_VMIDSEL_MASK |
+				              ES8388_CONTROL1_ENREF,
+				              0);
 		break;
 	}
 
@@ -480,8 +584,18 @@ static int es8388_component_probe(struct snd_soc_component *component)
 		goto clk_fail;
 	}
 
+        /* Sync our reg_defaults to hardware (R19, R2D differ from IC defaults) */
+        regcache_mark_dirty(priv->regmap);
+        ret = regcache_sync(priv->regmap);
+        if (ret) {
+            dev_err(dev, "failed to sync regcache: %d\n", ret);
+            goto sync_fail;
+        }
+
 	return 0;
 
+sync_fail:
+        clk_disable_unprepare(priv->clk);
 clk_fail:
 	regulator_bulk_disable(ES8388_SUPPLY_NUM, priv->supplies);
 	return ret;
