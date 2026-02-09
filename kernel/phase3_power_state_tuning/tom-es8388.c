@@ -1,3 +1,47 @@
+// SPDX-License-Identifier: GPL-2.0-only
+/*
+ * tom-es8388.c  --  ES8388 ALSA SoC Audio driver (practice)
+ *
+ * Author: Tom Hsieh <hungen3108@gmail.com>
+ *
+ * === Design Principles (matching upstream es8328.c) ===
+ *
+ * 1. hw_params: ONLY handles PCM-data-related registers
+ *    - Word length (R17 DACCONTROL1)
+ *    - MCLK/LRCK ratio (R18 DACCONTROL2)
+ *    - Does NOT touch power, volume, or routing
+ *
+ * 2. set_bias_level: Handles chip-level analog power
+ *    - R00 (CONTROL1): VMID, EnRef
+ *    - R01 (CONTROL2): overcurrent, thermal
+ *    - R02 (CHIPPOWER): force all-on in PREPARE as clean baseline
+ *
+ * 3. DAPM widgets: Handle signal-path power on/off
+ *    - R02 bits via SUPPLY widgets (DAC STM/DIG/DLL/Vref)
+ *    - R04 bits via DAC/PGA widgets (DACL/R, LOUT1/ROUT1)
+ *    - Mixer routing switches (R27[7], R2A[7])
+ *
+ * 4. kcontrols: Handle user-adjustable parameters
+ *    - PCM digital volume (R1A/R1B)
+ *    - Output amplifier volume (R2E/R2F)
+ *    - Exposed to userspace via ALSA mixer / Android AudioHAL
+ *
+ * === Why R02=0 in PREPARE? ===
+ *
+ * DAPM SUPPLY widgets control individual bits of R02 via read-modify-write.
+ * During power-up, they execute sequentially:
+ *   DAC Vref clears bit0 -> DAC DLL clears bit2 -> DAC STM clears bit4 -> ...
+ *
+ * Each intermediate state has some power blocks on and others off, which
+ * can cause pop noise or unstable behavior. Writing R02=0x00 in PREPARE
+ * ensures ALL chip power blocks are enabled atomically before DAPM acts.
+ *
+ * On the shutdown path (ON->PREPARE->STANDBY), PREPARE also writes R02=0,
+ * but DAPM immediately powers down widgets afterward. The brief all-on
+ * window is ~1 I2C transaction (~100us), far shorter than the IC's internal
+ * settling time, so it causes no audible effect.
+ */
+
 #include <linux/module.h>
 #include <linux/i2c.h>
 #include <linux/regmap.h>
@@ -5,48 +49,109 @@
 #include <linux/of_device.h>
 #include <linux/delay.h>
 #include <linux/clk.h>
-#include <sound/core.h> 
+#include <sound/core.h>
 #include <sound/initval.h>
 #include <sound/pcm.h>
 #include <sound/pcm_params.h>
 #include <sound/soc.h>
+#include <sound/tlv.h>
 
-#define ES8388_SUPPLY_NUM       4
-#define ES8388_REG_MAX          0x35
-#define ES8328_DACPOWER         0x04
-#define ES8328_CHIPPOWER        0x02
+/* ========== Register definitions ========== */
 
-/* ES8328_CHIPPOWER (R02) bit definitions */
-#define ES8328_CHIPPOWER_DACVREF_OFF    0
-#define ES8328_CHIPPOWER_ADCVREF_OFF    1
-#define ES8328_CHIPPOWER_DACDLL_OFF     2
-#define ES8328_CHIPPOWER_ADCDLL_OFF     3
-#define ES8328_CHIPPOWER_DACSTM_RESET   4
-#define ES8328_CHIPPOWER_ADCSTM_RESET   5
-#define ES8328_CHIPPOWER_DACDIG_OFF     6
-#define ES8328_CHIPPOWER_ADCDIG_OFF     7
+#define ES8388_SUPPLY_NUM	4
+#define ES8388_REG_MAX		0x35
+
+/* R00: Chip Control 1 */
+#define ES8388_CONTROL1			0x00
+#define ES8388_CONTROL1_VMIDSEL_MASK	(3 << 0)
+#define ES8388_CONTROL1_VMIDSEL_OFF	(0 << 0)
+#define ES8388_CONTROL1_VMIDSEL_50k	(1 << 0)
+#define ES8388_CONTROL1_VMIDSEL_500k	(2 << 0)
+#define ES8388_CONTROL1_VMIDSEL_5k	(3 << 0)
+#define ES8388_CONTROL1_ENREF		(1 << 2)
+
+/* R01: Chip Control 2 */
+#define ES8388_CONTROL2			0x01
+#define ES8388_CONTROL2_OVERCURRENT	(1 << 6)
+#define ES8388_CONTROL2_THERMAL		(1 << 7)
+
+/* R02: Chip Power Management */
+#define ES8388_CHIPPOWER		0x02
+#define ES8388_CHIPPOWER_DACVREF_OFF	0
+#define ES8388_CHIPPOWER_ADCVREF_OFF	1
+#define ES8388_CHIPPOWER_DACDLL_OFF	2
+#define ES8388_CHIPPOWER_ADCDLL_OFF	3
+#define ES8388_CHIPPOWER_DACSTM_RESET	4
+#define ES8388_CHIPPOWER_ADCSTM_RESET	5
+#define ES8388_CHIPPOWER_DACDIG_OFF	6
+#define ES8388_CHIPPOWER_ADCDIG_OFF	7
+
+/* R04: DAC Power Management */
+#define ES8388_DACPOWER			0x04
+#define ES8388_DACPOWER_RDAC_OFF	6
+#define ES8388_DACPOWER_LDAC_OFF	7
+#define ES8388_DACPOWER_ROUT1_ON	4
+#define ES8388_DACPOWER_LOUT1_ON	5
+
+/* R17: DAC Control 1 */
+#define ES8388_DACCONTROL1		0x17
+#define ES8388_DACCONTROL1_DACWL_SHIFT	3
+#define ES8388_DACCONTROL1_DACWL_MASK	(7 << 3)
+#define ES8388_DACCONTROL1_DACFMT_MASK	(3 << 1)
+
+/* R18: DAC Control 2 */
+#define ES8388_DACCONTROL2		0x18
+#define ES8388_DACCONTROL2_RATEMASK	(0x1f << 0)
+
+/* R19: DAC Control 3 */
+#define ES8388_DACCONTROL3		0x19
+#define ES8388_DACCONTROL3_DACMUTE	(1 << 2)
+
+/* DAC Digital Volume */
+#define ES8388_LDACVOL			0x1A
+#define ES8388_RDACVOL			0x1B
+#define ES8388_DACVOL_MAX		0xC0
+
+/* Mixer Controls */
+#define ES8388_DACCONTROL17		0x27
+#define ES8388_DACCONTROL20		0x2A
+
+/* Output Volume */
+#define ES8388_LOUT1VOL			0x2E
+#define ES8388_ROUT1VOL			0x2F
+#define ES8388_OUT1VOL_MAX		0x24
+
+/* R08: Master Mode */
+#define ES8388_MASTERMODE		0x08
+#define ES8388_MASTERMODE_MSC		(1 << 7)
+#define ES8388_MASTERMODE_MCLKDIV2	(1 << 6)
+
+/* ========== Private data ========== */
 
 struct es8388_priv {
 	struct regmap *regmap;
+	struct clk *clk;
 	struct regulator_bulk_data supplies[ES8388_SUPPLY_NUM];
-        struct clk *clk;
 };
 
-/* Default register values to ensure consistent initial state */
+/*
+ * reg_defaults: Only registers that are NOT controlled by DAPM or kcontrols.
+ *
+ * Key change: Removed R27, R2A, R2E, R2F from defaults.
+ * - R27[7]/R2A[7] (mixer switches) are controlled by DAPM mixer widgets
+ * - R2E/R2F (output volume) are controlled by kcontrols
+ * - R1A/R1B (DAC digital volume) are controlled by kcontrols
+ * Having them in reg_defaults causes conflicts: regcache_sync can overwrite
+ * values that DAPM/kcontrol have already set to a different state.
+ */
 static const struct reg_default es8388_reg_defaults[] = {
 	{ 0x00, 0x06 },  /* CONTROL1: VMIDSEL=500k, EnRef */
 	{ 0x01, 0xC0 },  /* CONTROL2: overcurrent + thermal shutdown */
-	{ 0x02, 0x00 },  /* CHIPPOWER: all powered on (DAC Vref, DLL, STM, DIG all enabled) */
-	{ 0x04, 0xC0 },  /* DACPOWER: DAC/Output powered down initially (DAPM will control) */
+	{ 0x02, 0x00 },  /* CHIPPOWER: all powered on */
+	{ 0x04, 0xC0 },  /* DACPOWER: DAC off, outputs off (DAPM controls) */
 	{ 0x17, 0x18 },  /* DACCONTROL1: I2S, 16-bit */
 	{ 0x18, 0x02 },  /* DACCONTROL2: MCLK/LRCK = 256 */
-	{ 0x19, 0x04 },  /* DACCONTROL3: DAC muted */
-	{ 0x1A, 0x00 },  /* LDACVOL: 0dB */
-	{ 0x1B, 0x00 },  /* RDACVOL: 0dB */
-	{ 0x27, 0x80 },  /* DACCONTROL17: Left mixer LD2LO on */
-	{ 0x2A, 0x80 },  /* DACCONTROL20: Right mixer RD2RO on */
-	{ 0x2E, 0x1E },  /* LOUT1VOL: 0dB */
-	{ 0x2F, 0x1E },  /* ROUT1VOL: 0dB */
+	{ 0x19, 0x22 },  /* DACCONTROL3: soft ramp on, mute off */
 };
 
 static const struct regmap_config es8388_regmap_config = {
@@ -60,144 +165,308 @@ static const struct regmap_config es8388_regmap_config = {
 	.num_reg_defaults = ARRAY_SIZE(es8388_reg_defaults),
 };
 
-static int tom_es8388_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt) {
-	pr_info("ES8388: set_dai_fmt entered\n");
+/* ========== kcontrols (userspace mixer controls) ========== */
 
-        pr_info("tom-es8388: set_dai_fmt fmt=0x%x\n", fmt);
+/*
+ * These are the controls that userspace (Android AudioHAL, alsa_amixer, etc.)
+ * uses to adjust volume and settings. Without these, userspace has no way to
+ * control the codec's volume, and may silently fail or produce unexpected
+ * behavior.
+ *
+ * TLV (Type-Length-Value) defines the dB scale for each control, so that
+ * userspace can display meaningful dB values instead of raw register values.
+ */
+static const DECLARE_TLV_DB_SCALE(dac_tlv, -9600, 50, 0);   /* R1A/R1B: 0 to -96dB, 0.5dB step */
+static const DECLARE_TLV_DB_SCALE(out_tlv, -4500, 150, 0);   /* R2E/R2F: -45 to +4.5dB, 1.5dB step */
 
-        switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
-                case SND_SOC_DAIFMT_CBC_CFC:
-                    pr_info("tom-es8388: codec slave (CBC_CFC)\n");
-                    break;
-                default:
-                    return -EINVAL;
-                }
-                
-                switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
-                case SND_SOC_DAIFMT_I2S:
-                    pr_info("tom-es8388: format I2S\n");
-                    break;
-                default:
-                    return -EINVAL;
-        }
-        
-        if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF)
-            return -EINVAL;
+static const struct snd_kcontrol_new es8388_snd_controls[] = {
+	/* DAC digital volume: R1A (left), R1B (right)
+	 * 0x00 = 0dB, 0xC0 = -96dB, inverted = 1 (higher value = lower volume) */
+	SOC_DOUBLE_R_TLV("PCM Volume",
+			 ES8388_LDACVOL, ES8388_RDACVOL,
+			 0, ES8388_DACVOL_MAX, 1, dac_tlv),
 
-        return 0;
+	/* Output amplifier volume: R2E (LOUT1), R2F (ROUT1)
+	 * 0x00 = -45dB, 0x1E = 0dB, 0x24 = +4.5dB, inverted = 0 */
+	SOC_DOUBLE_R_TLV("Output 1 Playback Volume",
+			 ES8388_LOUT1VOL, ES8388_ROUT1VOL,
+			 0, ES8388_OUT1VOL_MAX, 0, out_tlv),
+};
+
+/* ========== DAPM (Dynamic Audio Power Management) ========== */
+
+/* Mixer switch controls - these go INSIDE the DAPM mixer widgets.
+ * DAPM will automatically power the mixer path on/off based on whether
+ * there is a complete route from a source (Playback stream) to a sink (LOUT1/ROUT1).
+ *
+ * Unlike the kcontrols above, these are binary on/off switches for signal routing,
+ * not user-adjustable volume knobs. */
+static const struct snd_kcontrol_new es8388_left_mixer[] = {
+	SOC_DAPM_SINGLE("Playback Switch", ES8388_DACCONTROL17, 7, 1, 0),
+};
+
+static const struct snd_kcontrol_new es8388_right_mixer[] = {
+	SOC_DAPM_SINGLE("Playback Switch", ES8388_DACCONTROL20, 7, 1, 0),
+};
+
+static const struct snd_soc_dapm_widget es8388_dapm_widgets[] = {
+	/*
+	 * R02 SUPPLY widgets: chip-level power blocks.
+	 * These establish DAPM dependencies so that the DAC digital block
+	 * won't power up until its prerequisites (STM, Vref, DLL) are ready.
+	 *
+	 * Note: set_bias_level(PREPARE) writes R02=0x00 BEFORE these widgets
+	 * act, ensuring no intermediate power states. These widgets then
+	 * maintain the correct state and handle orderly shutdown.
+	 */
+	SND_SOC_DAPM_SUPPLY("DAC STM", ES8388_CHIPPOWER,
+			    ES8388_CHIPPOWER_DACSTM_RESET, 1, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("DAC DIG", ES8388_CHIPPOWER,
+			    ES8388_CHIPPOWER_DACDIG_OFF, 1, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("DAC DLL", ES8388_CHIPPOWER,
+			    ES8388_CHIPPOWER_DACDLL_OFF, 1, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("DAC Vref", ES8388_CHIPPOWER,
+			    ES8388_CHIPPOWER_DACVREF_OFF, 1, NULL, 0),
+
+	/* R04[7:6]: DAC power - controlled automatically when stream opens/closes */
+	SND_SOC_DAPM_DAC("DACL", "Playback", ES8388_DACPOWER,
+			 ES8388_DACPOWER_LDAC_OFF, 1),
+	SND_SOC_DAPM_DAC("DACR", "Playback", ES8388_DACPOWER,
+			 ES8388_DACPOWER_RDAC_OFF, 1),
+
+	/* Mixer: no power register (SND_SOC_NOPM), routing only */
+	SND_SOC_DAPM_MIXER("Left Mixer", SND_SOC_NOPM, 0, 0,
+			   es8388_left_mixer, ARRAY_SIZE(es8388_left_mixer)),
+	SND_SOC_DAPM_MIXER("Right Mixer", SND_SOC_NOPM, 0, 0,
+			   es8388_right_mixer, ARRAY_SIZE(es8388_right_mixer)),
+
+	/* R04[5:4]: Output amplifier power */
+	SND_SOC_DAPM_PGA("Left Out 1", ES8388_DACPOWER,
+			 ES8388_DACPOWER_LOUT1_ON, 0, NULL, 0),
+	SND_SOC_DAPM_PGA("Right Out 1", ES8388_DACPOWER,
+			 ES8388_DACPOWER_ROUT1_ON, 0, NULL, 0),
+
+	/* Physical output pins */
+	SND_SOC_DAPM_OUTPUT("LOUT1"),
+	SND_SOC_DAPM_OUTPUT("ROUT1"),
+	SND_SOC_DAPM_OUTPUT("LOUT2"),
+	SND_SOC_DAPM_OUTPUT("ROUT2"),
+};
+
+static const struct snd_soc_dapm_route es8388_routes[] = {
+	/* R02 supply chain: DIG depends on STM + Vref + DLL */
+	{ "DAC DIG", NULL, "DAC STM" },
+	{ "DAC DIG", NULL, "DAC Vref" },
+	{ "DAC DIG", NULL, "DAC DLL" },
+
+	/* DAC depends on the chip-level digital supply */
+	{ "DACL", NULL, "DAC DIG" },
+	{ "DACR", NULL, "DAC DIG" },
+
+	/* DAC -> Mixer (via Playback Switch) */
+	{ "Left Mixer",  "Playback Switch", "DACL" },
+	{ "Right Mixer", "Playback Switch", "DACR" },
+
+	/* Mixer -> Output Amp -> Output Pin */
+	{ "Left Out 1",  NULL, "Left Mixer" },
+	{ "Right Out 1", NULL, "Right Mixer" },
+	{ "LOUT1", NULL, "Left Out 1" },
+	{ "ROUT1", NULL, "Right Out 1" },
+};
+
+/* ========== DAI operations ========== */
+
+static int tom_es8388_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
+{
+	struct snd_soc_component *component = dai->component;
+	int ret;
+
+	/* Clock provider/consumer */
+	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
+	case SND_SOC_DAIFMT_CBC_CFC:
+		ret = snd_soc_component_update_bits(component, ES8388_MASTERMODE,
+						    ES8388_MASTERMODE_MSC, 0);
+		if (ret < 0)
+			return ret;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	/* Interface format */
+	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
+	case SND_SOC_DAIFMT_I2S:
+		ret = snd_soc_component_update_bits(component, ES8388_DACCONTROL1,
+						    ES8388_DACCONTROL1_DACFMT_MASK, 0);
+		if (ret < 0)
+			return ret;
+		break;
+	default:
+		return -EINVAL;
+	}
+
+	/* Clock inversion */
+	if ((fmt & SND_SOC_DAIFMT_INV_MASK) != SND_SOC_DAIFMT_NB_NF)
+		return -EINVAL;
+
+	return 0;
 }
 
+/*
+ * hw_params: ONLY handles PCM-data-related configuration.
+ *
+ * This callback is invoked when the PCM stream parameters are negotiated.
+ * It configures HOW the codec interprets the incoming I2S data, not whether
+ * the codec is powered on (that's bias_level + DAPM's job).
+ */
 static int tom_es8388_hw_params(struct snd_pcm_substream *substream,
-                                struct snd_pcm_hw_params *params,
-                                struct snd_soc_dai *dai)
+				struct snd_pcm_hw_params *params,
+				struct snd_soc_dai *dai)
 {
-        struct snd_soc_component *component = dai->component;
-        unsigned int wl;
-        unsigned int val;
+	struct snd_soc_component *component = dai->component;
+	int wl;
+	int ret;
 
-        dev_info(component->dev, "hw_params: rate=%d, format=%d, channels=%d\n",
-                 params_rate(params), params_format(params), params_channels(params));
+	switch (params_width(params)) {
+	case 16: wl = 3; break;
+	case 18: wl = 2; break;
+	case 20: wl = 1; break;
+	case 24: wl = 0; break;
+	case 32: wl = 4; break;
+	default: return -EINVAL;
+	}
 
-        switch (params_format(params)) {
-            case SNDRV_PCM_FORMAT_S16_LE:
-                wl = 0x03;
-                break;
-            case SNDRV_PCM_FORMAT_S24_LE:
-                wl = 0x00;
-                break;
-            case SNDRV_PCM_FORMAT_S32_LE:
-                wl = 0x04;
-                break;
-            default:
-                return -EINVAL;
-        }
+	/* R17: DAC word length only (preserve format bits set by set_dai_fmt) */
+	ret = snd_soc_component_update_bits(component, ES8388_DACCONTROL1,
+					    ES8388_DACCONTROL1_DACWL_MASK,
+					    wl << ES8388_DACCONTROL1_DACWL_SHIFT);
+	if (ret < 0)
+		return ret;
 
-        /* R17: DAC Control 1 - I2S format + word length */
-        /* bit[2:1]=00 (I2S), bit[5:3]=wl */
-        val = (wl << 3) | 0x00;  /* I2S format */
-        snd_soc_component_write(component, 0x17, val);
-        dev_info(component->dev, "hw_params: R17=0x%02x (wl=%d)\n", val, wl);
+	/* R18: MCLK/LRCK ratio - slave mode auto-detects, write 0 */
+	ret = snd_soc_component_update_bits(component, ES8388_DACCONTROL2,
+					    ES8388_DACCONTROL2_RATEMASK, 0);
+	if (ret < 0)
+		return ret;
 
-        /* R18: DAC Control 2 - MCLK/LRCK ratio */
-        /* 12.288MHz MCLK / 48kHz = 256, DACFsRatio = 00010 */
-        snd_soc_component_write(component, 0x18, 0x02);
-        dev_info(component->dev, "hw_params: R18=0x02 (256fs)\n");
-
-        return 0;
+	return 0;
 }
 
 static int tom_es8388_mute(struct snd_soc_dai *dai, int mute, int direction)
 {
-    struct snd_soc_component *component = dai->component;
-    int ret;
-    
-    dev_info(component->dev, "mute: %d, direction: %d\n", mute, direction);
-    
-    ret = snd_soc_component_update_bits(component, 0x19, 0x04,
-                                        mute ? 0x04 : 0x00);
-    
-    /* Debug: print register state after mute/unmute */
-    if (ret == 0) {
-        dev_info(component->dev, "After mute=%d: R02=0x%02x R04=0x%02x R19=0x%02x\n",
-                 mute,
-                 snd_soc_component_read(component, 0x02),
-                 snd_soc_component_read(component, 0x04),
-                 snd_soc_component_read(component, 0x19));
-    }
-    
-    return ret;
+	return snd_soc_component_update_bits(dai->component, ES8388_DACCONTROL3,
+					     ES8388_DACCONTROL3_DACMUTE,
+					     mute ? ES8388_DACCONTROL3_DACMUTE : 0);
 }
 
 static const struct snd_soc_dai_ops tom_es8388_dai_ops = {
-        .set_fmt   = tom_es8388_set_dai_fmt,
-        .hw_params = tom_es8388_hw_params,
-        .mute_stream   = tom_es8388_mute,
-        .no_capture_mute = 1,
+	.set_fmt	= tom_es8388_set_dai_fmt,
+	.hw_params	= tom_es8388_hw_params,
+	.mute_stream	= tom_es8388_mute,
+	.no_capture_mute = 1,
 };
 
 static struct snd_soc_dai_driver es8388_dai = {
-        .name = "tom-es8388-hifi",
-        .ops  = &tom_es8388_dai_ops,
-        .playback = {
-                .stream_name = "Playback",
-                .channels_min = 2,
-                .channels_max = 2,
-                .rates = (SNDRV_PCM_RATE_192000 |
-                          SNDRV_PCM_RATE_96000 | \
-                          SNDRV_PCM_RATE_88200 | \
-                          SNDRV_PCM_RATE_8000_48000),
-                .formats = (SNDRV_PCM_FMTBIT_S16_LE |
-                            SNDRV_PCM_FMTBIT_S18_3LE | \
-                            SNDRV_PCM_FMTBIT_S20_3LE | \
-                            SNDRV_PCM_FMTBIT_S24_LE | \
-                            SNDRV_PCM_FMTBIT_S32_LE),
-        },
+	.name = "tom-es8388-hifi",
+	.ops  = &tom_es8388_dai_ops,
+	.playback = {
+		.stream_name  = "Playback",
+		.channels_min = 2,
+		.channels_max = 2,
+		.rates	      = SNDRV_PCM_RATE_8000_96000,
+		.formats      = (SNDRV_PCM_FMTBIT_S16_LE |
+				 SNDRV_PCM_FMTBIT_S24_LE |
+				 SNDRV_PCM_FMTBIT_S32_LE),
+	},
 };
 
+/* ========== Bias Level (chip-level analog power) ========== */
 
+/*
+ * Bias level controls the chip's analog reference and VMID.
+ * This is separate from the signal-path power managed by DAPM.
+ *
+ * Transition sequence during playback:
+ *   Boot:   -> OFF -> STANDBY (idle_bias_on)
+ *   Play:   STANDBY -> PREPARE -> ON
+ *   Pause:  ON -> PREPARE -> STANDBY (after use_pmdown_time)
+ *   Play:   STANDBY -> PREPARE -> ON
+ *
+ * R02 is written to 0x00 in PREPARE to provide a deterministic starting
+ * point before DAPM widgets act. See file header comment for details.
+ */
 static int tom_es8388_set_bias_level(struct snd_soc_component *component,
-				     enum snd_soc_bias_level level);
+				     enum snd_soc_bias_level level)
+{
+	switch (level) {
+	case SND_SOC_BIAS_ON:
+		break;
+
+	case SND_SOC_BIAS_PREPARE:
+		/* R02: Force all chip power blocks on atomically.
+		 * This provides a clean baseline before DAPM widgets
+		 * individually manage their R02 bits. */
+		snd_soc_component_write(component, ES8388_CHIPPOWER, 0);
+
+		/* R00: VMID=50k (fast), enable reference */
+		snd_soc_component_update_bits(component, ES8388_CONTROL1,
+				ES8388_CONTROL1_VMIDSEL_MASK |
+				ES8388_CONTROL1_ENREF,
+				ES8388_CONTROL1_VMIDSEL_50k |
+				ES8388_CONTROL1_ENREF);
+		break;
+
+	case SND_SOC_BIAS_STANDBY:
+		if (snd_soc_component_get_bias_level(component) ==
+		    SND_SOC_BIAS_OFF) {
+			/* First power up: 5k fast charge for VMID capacitors */
+			snd_soc_component_update_bits(component, ES8388_CONTROL1,
+					ES8388_CONTROL1_VMIDSEL_MASK |
+					ES8388_CONTROL1_ENREF,
+					ES8388_CONTROL1_VMIDSEL_5k |
+					ES8388_CONTROL1_ENREF);
+			msleep(100);
+		}
+
+		/* R01: Enable overcurrent + thermal protection */
+		snd_soc_component_write(component, ES8388_CONTROL2,
+				ES8388_CONTROL2_OVERCURRENT |
+				ES8388_CONTROL2_THERMAL);
+
+		/* R00: VMID=500k (low power standby), keep reference on */
+		snd_soc_component_update_bits(component, ES8388_CONTROL1,
+				ES8388_CONTROL1_VMIDSEL_MASK |
+				ES8388_CONTROL1_ENREF,
+				ES8388_CONTROL1_VMIDSEL_500k |
+				ES8388_CONTROL1_ENREF);
+		break;
+
+	case SND_SOC_BIAS_OFF:
+		/* Disable VMID and reference entirely */
+		snd_soc_component_update_bits(component, ES8388_CONTROL1,
+				ES8388_CONTROL1_VMIDSEL_MASK |
+				ES8388_CONTROL1_ENREF,
+				0);
+		break;
+	}
+
+	return 0;
+}
+
+/* ========== Component lifecycle ========== */
 
 static int es8388_component_probe(struct snd_soc_component *component)
 {
+	struct es8388_priv *priv = snd_soc_component_get_drvdata(component);
 	struct device *dev = component->dev;
-	struct es8388_priv *priv;
 	int ret;
 
-	priv = dev_get_drvdata(dev);
-	if (!priv || !priv->regmap) {
-		dev_err(dev, "component probe: invalid priv or regmap\n");
-		return -EINVAL;
-	}
-
-	/* Enable regulators - this is where hardware actually powers up */
 	ret = regulator_bulk_enable(ES8388_SUPPLY_NUM, priv->supplies);
 	if (ret) {
 		dev_err(dev, "unable to enable regulators: %d\n", ret);
 		return ret;
 	}
 
-	/* Get and enable clock */
 	priv->clk = devm_clk_get(dev, "mclk");
 	if (IS_ERR(priv->clk)) {
 		dev_err(dev, "failed to get mclk: %ld\n", PTR_ERR(priv->clk));
@@ -211,30 +480,8 @@ static int es8388_component_probe(struct snd_soc_component *component)
 		goto clk_fail;
 	}
 
-	/* Hardware just powered up, sync reg_defaults to hardware */
-	regcache_cache_only(priv->regmap, false);
-	regcache_mark_dirty(priv->regmap);
-	ret = regcache_sync(priv->regmap);
-	if (ret) {
-		dev_err(dev, "failed to sync regcache: %d\n", ret);
-		goto sync_fail;
-	}
-
-	dev_info(dev, "es8388 component probe ok, mclk=%lu Hz, regcache synced\n",
-		 clk_get_rate(priv->clk));
-
-	/* Debug: print initial register state after regcache_sync */
-	dev_info(dev, "Initial state: R02=0x%02x R04=0x%02x R19=0x%02x R27=0x%02x R2A=0x%02x\n",
-		 snd_soc_component_read(component, 0x02),
-		 snd_soc_component_read(component, 0x04),
-		 snd_soc_component_read(component, 0x19),
-		 snd_soc_component_read(component, 0x27),
-		 snd_soc_component_read(component, 0x2A));
-
 	return 0;
 
-sync_fail:
-	clk_disable_unprepare(priv->clk);
 clk_fail:
 	regulator_bulk_disable(ES8388_SUPPLY_NUM, priv->supplies);
 	return ret;
@@ -244,13 +491,8 @@ static void es8388_component_remove(struct snd_soc_component *component)
 {
 	struct es8388_priv *priv = snd_soc_component_get_drvdata(component);
 
-	if (!priv)
-		return;
-
 	clk_disable_unprepare(priv->clk);
 	regulator_bulk_disable(ES8388_SUPPLY_NUM, priv->supplies);
-
-	dev_info(component->dev, "es8388 component removed\n");
 }
 
 static int es8388_suspend(struct snd_soc_component *component)
@@ -258,13 +500,13 @@ static int es8388_suspend(struct snd_soc_component *component)
 	struct es8388_priv *priv = snd_soc_component_get_drvdata(component);
 
 	clk_disable_unprepare(priv->clk);
-
 	return regulator_bulk_disable(ES8388_SUPPLY_NUM, priv->supplies);
 }
 
 static int es8388_resume(struct snd_soc_component *component)
 {
 	struct es8388_priv *priv = snd_soc_component_get_drvdata(component);
+	struct regmap *regmap = dev_get_regmap(component->dev, NULL);
 	int ret;
 
 	ret = clk_prepare_enable(priv->clk);
@@ -280,9 +522,8 @@ static int es8388_resume(struct snd_soc_component *component)
 		return ret;
 	}
 
-	/* Sync regcache with hardware after power up */
-	regcache_mark_dirty(priv->regmap);
-	ret = regcache_sync(priv->regmap);
+	regcache_mark_dirty(regmap);
+	ret = regcache_sync(regmap);
 	if (ret) {
 		dev_err(component->dev, "unable to sync regcache: %d\n", ret);
 		return ret;
@@ -291,137 +532,28 @@ static int es8388_resume(struct snd_soc_component *component)
 	return 0;
 }
 
-static const struct snd_kcontrol_new es8388_left_mixer[] = {
-    SOC_DAPM_SINGLE("DACL Switch", 0x27, 7, 1, 0),
-};
-
-static const struct snd_kcontrol_new es8388_right_mixer[] = {
-    SOC_DAPM_SINGLE("DACR Switch", 0x2A, 7, 1, 0),
-};
-
-static const struct snd_soc_dapm_widget es8388_dapm_widgets[] = {
-    /* Power supplies for R02 (CHIPPOWER) - these control different bits of R02 */
-    SND_SOC_DAPM_SUPPLY("DAC STM", ES8328_CHIPPOWER,
-                        ES8328_CHIPPOWER_DACSTM_RESET, 1, NULL, 0),
-    SND_SOC_DAPM_SUPPLY("DAC DIG", ES8328_CHIPPOWER,
-                        ES8328_CHIPPOWER_DACDIG_OFF, 1, NULL, 0),
-    SND_SOC_DAPM_SUPPLY("DAC DLL", ES8328_CHIPPOWER,
-                        ES8328_CHIPPOWER_DACDLL_OFF, 1, NULL, 0),
-    SND_SOC_DAPM_SUPPLY("DAC Vref", ES8328_CHIPPOWER,
-                        ES8328_CHIPPOWER_DACVREF_OFF, 1, NULL, 0),
-
-    /* DAC widgets - controlled by R04 (DACPOWER) */
-    SND_SOC_DAPM_DAC("DACL", "Playback", ES8328_DACPOWER, 7, 1),
-    SND_SOC_DAPM_DAC("DACR", "Playback", ES8328_DACPOWER, 6, 1),
-
-    /* Output amplifiers - controlled by R04 (DACPOWER) */
-    SND_SOC_DAPM_PGA("LOUT1 Amp", ES8328_DACPOWER, 5, 0, NULL, 0),
-    SND_SOC_DAPM_PGA("ROUT1 Amp", ES8328_DACPOWER, 4, 0, NULL, 0),
-
-    /* Mixer widgets */
-    SND_SOC_DAPM_MIXER("Left Mixer",  SND_SOC_NOPM, 0, 0,
-                        es8388_left_mixer, ARRAY_SIZE(es8388_left_mixer)),
-    SND_SOC_DAPM_MIXER("Right Mixer", SND_SOC_NOPM, 0, 0,
-                        es8388_right_mixer, ARRAY_SIZE(es8388_right_mixer)),
-
-    /* Output pins */
-    SND_SOC_DAPM_OUTPUT("LOUT1"),
-    SND_SOC_DAPM_OUTPUT("ROUT1"),
-    SND_SOC_DAPM_OUTPUT("LOUT2"),
-    SND_SOC_DAPM_OUTPUT("ROUT2"),
-};
-
-static const struct snd_soc_dapm_route es8388_routes[] = {
-    /* SUPPLY dependencies - DAC DIG needs these supplies */
-    { "DAC DIG", NULL, "DAC STM" },
-    { "DAC DIG", NULL, "DAC Vref" },
-    { "DAC DIG", NULL, "DAC DLL" },
-
-    /* DAC depends on DAC DIG supply */
-    { "DACL", NULL, "DAC DIG" },
-    { "DACR", NULL, "DAC DIG" },
-
-    /* Mixer routing */
-    { "Left Mixer",  "DACL Switch", "DACL" },
-    { "Right Mixer", "DACR Switch", "DACR" },
-
-    /* Output amplifier routing */
-    { "LOUT1 Amp", NULL, "Left Mixer" },
-    { "ROUT1 Amp", NULL, "Right Mixer" },
-
-    /* Output pin routing */
-    { "LOUT1", NULL, "LOUT1 Amp" },
-    { "ROUT1", NULL, "ROUT1 Amp" },
-};
-
-static const char *bias_level_name(enum snd_soc_bias_level level)
-{
-	switch (level) {
-	case SND_SOC_BIAS_OFF:     return "OFF";
-	case SND_SOC_BIAS_STANDBY: return "STANDBY";
-	case SND_SOC_BIAS_PREPARE: return "PREPARE";
-	case SND_SOC_BIAS_ON:      return "ON";
-	default:                   return "UNKNOWN";
-	}
-}
-
-static int tom_es8388_set_bias_level(struct snd_soc_component *component,
-                                     enum snd_soc_bias_level level)
-{
-    enum snd_soc_bias_level old_level = snd_soc_component_get_bias_level(component);
-
-    dev_info(component->dev, "bias: %s -> %s\n",
-             bias_level_name(old_level), bias_level_name(level));
-
-    switch (level) {
-    case SND_SOC_BIAS_ON:
-        break;
-
-    case SND_SOC_BIAS_PREPARE:
-        /* VREF, VMID=2x50k, digital enabled
-         * NOTE: We don't touch R02 here! DAPM SUPPLY widgets control R02 bits */
-        snd_soc_component_update_bits(component, 0x00, 0x07, 0x05);
-        break;
-
-    case SND_SOC_BIAS_STANDBY:
-        if (old_level == SND_SOC_BIAS_OFF) {
-            /* 5kΩ Fast Charge */
-            snd_soc_component_update_bits(component, 0x00, 0x07, 0x07);
-            msleep(100);  /* Standard charge time */
-        }
-
-        /* R01: overcurrent + thermal shutdown */
-        snd_soc_component_write(component, 0x01, 0xC0);
-        
-        /* VREF, VMID=2*500k, digital stopped */
-        snd_soc_component_update_bits(component, 0x00, 0x07, 0x06);
-        break;
-
-    case SND_SOC_BIAS_OFF:
-        /* Turn OFF VREF */
-        snd_soc_component_update_bits(component, 0x00, 0x07, 0x00);
-        break;
-    }
-
-    return 0;
-}
+/* ========== Component driver ========== */
 
 static const struct snd_soc_component_driver es8388_component_driver = {
-        .name = "tom-es8388",
-        .probe = es8388_component_probe,
-        .remove = es8388_component_remove,
-        .suspend = es8388_suspend,
-        .resume = es8388_resume,
-        .set_bias_level = tom_es8388_set_bias_level,
-        .dapm_widgets = es8388_dapm_widgets,
-        .num_dapm_widgets = ARRAY_SIZE(es8388_dapm_widgets),
-        .dapm_routes = es8388_routes,
-        .num_dapm_routes = ARRAY_SIZE(es8388_routes),
-        .idle_bias_on = 1,
-        .suspend_bias_off = 1,
-        .use_pmdown_time = 1,
-        .endianness = 1,
+	.name			= "tom-es8388",
+	.probe			= es8388_component_probe,
+	.remove			= es8388_component_remove,
+	.suspend		= es8388_suspend,
+	.resume			= es8388_resume,
+	.set_bias_level		= tom_es8388_set_bias_level,
+	.controls		= es8388_snd_controls,
+	.num_controls		= ARRAY_SIZE(es8388_snd_controls),
+	.dapm_widgets		= es8388_dapm_widgets,
+	.num_dapm_widgets	= ARRAY_SIZE(es8388_dapm_widgets),
+	.dapm_routes		= es8388_routes,
+	.num_dapm_routes	= ARRAY_SIZE(es8388_routes),
+	.idle_bias_on		= 1,
+	.suspend_bias_off	= 1,
+	.use_pmdown_time	= 1,
+	.endianness		= 1,
 };
+
+/* ========== I2C driver ========== */
 
 static int es8388_i2c_probe(struct i2c_client *i2c)
 {
@@ -435,15 +567,11 @@ static int es8388_i2c_probe(struct i2c_client *i2c)
 		return -ENOMEM;
 
 	regmap = devm_regmap_init_i2c(i2c, &es8388_regmap_config);
-	if (IS_ERR(regmap)) {
-		ret = PTR_ERR(regmap);
-		dev_err(dev, "regmap init failed: %d\n", ret);
-		return ret;
-	}
+	if (IS_ERR(regmap))
+		return PTR_ERR(regmap);
 
 	priv->regmap = regmap;
 
-	/* Setup regulator supplies */
 	priv->supplies[0].supply = "DVDD";
 	priv->supplies[1].supply = "AVDD";
 	priv->supplies[2].supply = "PVDD";
@@ -455,20 +583,10 @@ static int es8388_i2c_probe(struct i2c_client *i2c)
 		return ret;
 	}
 
-	/* IMPORTANT: Don't enable regulators/clock here!
-	 * They will be enabled in component_probe when ASoC framework is ready */
-
 	dev_set_drvdata(dev, priv);
 
-	ret = devm_snd_soc_register_component(dev,
+	return devm_snd_soc_register_component(dev,
 				&es8388_component_driver, &es8388_dai, 1);
-	if (ret) {
-		dev_err(dev, "failed to register component: %d\n", ret);
-		return ret;
-	}
-
-	dev_info(dev, "ES8388 i2c probe ok\n");
-	return 0;
 }
 
 static const struct of_device_id es8388_of_match[] = {
@@ -479,7 +597,7 @@ MODULE_DEVICE_TABLE(of, es8388_of_match);
 
 static struct i2c_driver es8388_driver = {
 	.driver = {
-		.name           = "tom-es8388",
+		.name		= "tom-es8388",
 		.of_match_table = es8388_of_match,
 	},
 	.probe_new = es8388_i2c_probe,
@@ -487,6 +605,6 @@ static struct i2c_driver es8388_driver = {
 
 module_i2c_driver(es8388_driver);
 
-MODULE_DESCRIPTION("Tom ES8388 driver (skeleton: regmap + bulk regulators)");
+MODULE_DESCRIPTION("Tom ES8388 ALSA SoC audio driver (practice)");
 MODULE_AUTHOR("Tom Hsieh <hungen3108@gmail.com>");
 MODULE_LICENSE("GPL");
