@@ -492,8 +492,6 @@ static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 {
 	switch (level) {
 	case SND_SOC_BIAS_ON:
-                /* Playback state: Set VROI to 1.5k Ohm for proper output driving capability */
-                snd_soc_component_update_bits(component, 0x2D, 0x10, 0);
 		break;
 
 	case SND_SOC_BIAS_PREPARE:
@@ -501,16 +499,6 @@ static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 		 * This provides a clean baseline before DAPM widgets
 		 * individually manage their R02 bits. */
 		snd_soc_component_write(component, ES8388_CHIPPOWER, 0);
-
-		/* R00: VMID=50k (fast), enable reference */
-		snd_soc_component_update_bits(component, ES8388_CONTROL1,
-				ES8388_CONTROL1_VMIDSEL_MASK |
-				ES8388_CONTROL1_ENREF,
-				ES8388_CONTROL1_VMIDSEL_50k |
-				ES8388_CONTROL1_ENREF);
-
-                /* Standby state: Set VROI to 40k Ohm high impedance to prevent pop noise from rapid discharge */
-                snd_soc_component_update_bits(component, 0x2D, 0x10, 0x10);
 		break;
 
 	case SND_SOC_BIAS_STANDBY:
@@ -522,35 +510,18 @@ static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 					ES8388_CONTROL1_ENREF,
 					ES8388_CONTROL1_VMIDSEL_5k |
 					ES8388_CONTROL1_ENREF);
-			msleep(50);
+			msleep(100);
 		}
-
-		/* R01: Enable overcurrent + thermal protection */
-		snd_soc_component_write(component, ES8388_CONTROL2,
-				ES8388_CONTROL2_OVERCURRENT |
-				ES8388_CONTROL2_THERMAL);
 
 		/* R00: VMID=50k (low power standby), keep reference on */
 		snd_soc_component_update_bits(component, ES8388_CONTROL1,
 				ES8388_CONTROL1_VMIDSEL_MASK |
 				ES8388_CONTROL1_ENREF,
-				ES8388_CONTROL1_VMIDSEL_50k |
+				ES8388_CONTROL1_VMIDSEL_500k |
 				ES8388_CONTROL1_ENREF);
 		break;
 
 	case SND_SOC_BIAS_OFF:
-		/* Disable VMID and reference entirely */
-                /* Let DAC fully settle before power-down */
-                msleep(50);
-
-                /* Turn off DAC + output amp */
-                snd_soc_component_write(component, ES8388_DACPOWER, 0xC0);
-
-                /* Disable VMID and reference */
-		snd_soc_component_update_bits(component, ES8388_CONTROL1,
-				              ES8388_CONTROL1_VMIDSEL_MASK |
-				              ES8388_CONTROL1_ENREF,
-				              0);
 		break;
 	}
 
