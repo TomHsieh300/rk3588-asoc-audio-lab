@@ -168,6 +168,8 @@ static const struct reg_default es8388_reg_defaults[] = {
         { ES8388_DACCONTROL6, ES8388_DACCONTROL6_CLICKFREE }, /* 0x08 */
         { ES8388_LOUT1VOL, 0x1E },   /* LOUT1: 0dB (volume ramp target) */
         { ES8388_ROUT1VOL, 0x1E },   /* ROUT1: 0dB (volume ramp target) */
+        { ES8388_DACCONTROL17, 0xB8 },  /* bit7=1: Left DAC → Left Mixer */
+	{ ES8388_DACCONTROL20, 0xB8 },  /* bit7=1: Right DAC → Right Mixer */
 };
 
 static const struct regmap_config es8388_regmap_config = {
@@ -549,9 +551,6 @@ static int es8388_component_probe(struct snd_soc_component *component)
 	/* Init DAC volume cache for mute ramp (R1A/R1B: 0x00 = 0dB) */
 	priv->dac_lvol = 0x00;
 	priv->dac_rvol = 0x00;
-
-        snd_soc_component_update_bits(component, 0x27, 0x80, 0x80);  /* Left mixer on */
-        snd_soc_component_update_bits(component, 0x2A, 0x80, 0x80);  /* Right mixer on */
 
 	return 0;
 
