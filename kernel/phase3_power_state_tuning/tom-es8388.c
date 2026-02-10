@@ -36,7 +36,7 @@
 #include <linux/i2c.h>
 #include <linux/regmap.h>
 #include <linux/regulator/consumer.h>
-#include <linux/of_device.h>
+#include <linux/mod_devicetable.h>
 #include <linux/delay.h>
 #include <linux/clk.h>
 #include <sound/core.h>
@@ -119,7 +119,7 @@
 /* Output Volume */
 #define ES8388_LOUT1VOL			0x2E
 #define ES8388_ROUT1VOL			0x2F
-#define ES8388_OUT1VOL_MAX		0x24
+#define ES8388_OUT1VOL_MAX		0x21
 
 /* R08: Master Mode */
 #define ES8388_MASTERMODE		0x08
@@ -153,8 +153,8 @@ static const struct reg_default es8388_reg_defaults[] = {
         { 0x2D, 0x10 },  /* DACCONTROL23: VROI=40k (slow discharge, less stop pop) */
 	{ ES8388_DACCONTROL3, 0x26 },  /* DAC muted, soft ramp on, 4 LRCK/step */
 	{ ES8388_DACCONTROL6, ES8388_DACCONTROL6_CLICKFREE },
-	{ ES8388_LOUT1VOL, 0x1E },    /* LOUT1: 0dB */
-	{ ES8388_ROUT1VOL, 0x1E },    /* ROUT1: 0dB */
+	{ ES8388_LOUT1VOL, 0x1C },    /* LOUT1: -3dB */
+	{ ES8388_ROUT1VOL, 0x1C },    /* ROUT1: -3dB */
 	/* Mixer: DAC-to-output always on. DAPM switch is NOPM (no register I/O),
 	 * so regcache_sync sets the initial routing state instead. */
 	{ ES8388_DACCONTROL17, 0xB8 }, /* bit7=1: Left DAC -> Left Mixer */
@@ -548,7 +548,9 @@ static int es8388_resume(struct snd_soc_component *component)
 	ret = regcache_sync(regmap);
 	if (ret) {
 		dev_err(component->dev, "unable to sync regcache: %d\n", ret);
-		return ret;
+                regulator_bulk_disable(ES8388_SUPPLY_NUM, priv->supplies);
+		clk_disable_unprepare(priv->clk);
+                return ret;
 	}
 
 	return 0;
