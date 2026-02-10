@@ -142,6 +142,8 @@ struct es8388_priv {
 	struct regmap *regmap;
 	struct clk *clk;
 	struct regulator_bulk_data supplies[ES8388_SUPPLY_NUM];
+        unsigned int dac_lvol;   /* cached LDACVOL (R1A) for mute ramp */
+	unsigned int dac_rvol;   /* cached RDACVOL (R1B) for mute ramp */
 };
 
 /*
@@ -162,8 +164,10 @@ static const struct reg_default es8388_reg_defaults[] = {
 	{ 0x17, 0x18 },  /* DACCONTROL1: I2S, 16-bit */
 	{ 0x18, 0x02 },  /* DACCONTROL2: MCLK/LRCK = 256 */
         { 0x2D, 0x10 },  /* DACCONTROL23: VROI=40k (slow discharge = no stop pop) */
-        { ES8388_DACCONTROL3, 0x22 | ES8388_DACCONTROL3_RAMPRATE_128LRCK },
+        { ES8388_DACCONTROL3, 0x26 | ES8388_DACCONTROL3_RAMPRATE_128LRCK },
         { ES8388_DACCONTROL6, ES8388_DACCONTROL6_CLICKFREE }, /* 0x08 */
+        { ES8388_LOUT1VOL, 0x1E },   /* LOUT1: 0dB (volume ramp target) */
+        { ES8388_ROUT1VOL, 0x1E },   /* ROUT1: 0dB (volume ramp target) */
 };
 
 static const struct regmap_config es8388_regmap_config = {
@@ -205,71 +209,6 @@ static const struct snd_kcontrol_new es8388_snd_controls[] = {
 			 0, ES8388_OUT1VOL_MAX, 0, out_tlv),
 };
 
-/*
- * Output PGA DAPM event handler for pop-noise suppression.
- *
- * This callback is used to mute/unmute the DAC at proper timing
- * when the output amplifier is powered on/off by DAPM.
- *
- * Power-up sequence (PRE_PMU -> POST_PMU):
- *
- *   1. PRE_PMU:
- *      Mute DAC before enabling output stage.
- *      This prevents unstable analog bias / VMID charging noise
- *      from being amplified by the output PGA.
- *
- *   2. POST_PMU:
- *      Wait for analog circuits (DAC, VMID, output driver)
- *      to settle after power-up.
- *      Then unmute DAC to start playback cleanly.
- *
- * Power-down sequence (PRE_PMD):
- *
- *   3. PRE_PMD:
- *      Mute DAC before disabling output stage.
- *      This avoids pop/click caused by sudden discharge of
- *      output capacitors and bias collapse.
- *
- * Overall goal:
- *   Ensure that audio signal is always muted during
- *   unstable analog power transitions, so that
- *   power on/off does not generate audible pop noise.
- */
-
-static int es8388_out1_pga_event(struct snd_soc_dapm_widget *w,
-                                 struct snd_kcontrol *kcontrol,
-                                 int event)
-{
-    struct snd_soc_component *c = snd_soc_dapm_to_component(w->dapm);
-
-    switch (event) {
-    case SND_SOC_DAPM_PRE_PMU:
-        /* Mute DAC before output amplifier turns on */
-        snd_soc_component_update_bits(c, ES8388_DACCONTROL3,
-                                      ES8388_DACCONTROL3_DACMUTE,
-                                      ES8388_DACCONTROL3_DACMUTE);
-        break;
-
-    case SND_SOC_DAPM_POST_PMU:
-        /* Wait longer to ensure VMID bias is fully stable on the decoupling capacitors */
-        msleep(150);
-        snd_soc_component_update_bits(c, ES8388_DACCONTROL3,
-                                      ES8388_DACCONTROL3_DACMUTE, 0);
-        break;
-
-    case SND_SOC_DAPM_PRE_PMD:
-         /* Ensure enough time for Digital Soft Ramp to finish before cutting analog power */
-        snd_soc_component_update_bits(c, ES8388_DACCONTROL3,
-                                      ES8388_DACCONTROL3_DACMUTE,
-                                      ES8388_DACCONTROL3_DACMUTE);
-        msleep(50);
-        break;
-    }
-
-    return 0;
-}
-
-
 /* ========== DAPM (Dynamic Audio Power Management) ========== */
 
 /* Mixer switch controls - these go INSIDE the DAPM mixer widgets.
@@ -279,11 +218,11 @@ static int es8388_out1_pga_event(struct snd_soc_dapm_widget *w,
  * Unlike the kcontrols above, these are binary on/off switches for signal routing,
  * not user-adjustable volume knobs. */
 static const struct snd_kcontrol_new es8388_left_mixer[] = {
-	SOC_DAPM_SINGLE("Playback Switch", ES8388_DACCONTROL17, 7, 1, 0),
+	SOC_DAPM_SINGLE("Playback Switch", SND_SOC_NOPM, 0, 1, 0),
 };
 
 static const struct snd_kcontrol_new es8388_right_mixer[] = {
-	SOC_DAPM_SINGLE("Playback Switch", ES8388_DACCONTROL20, 7, 1, 0),
+	SOC_DAPM_SINGLE("Playback Switch", SND_SOC_NOPM, 0, 1, 0),
 };
 
 static const struct snd_soc_dapm_widget es8388_dapm_widgets[] = {
@@ -296,20 +235,19 @@ static const struct snd_soc_dapm_widget es8388_dapm_widgets[] = {
 	 * act, ensuring no intermediate power states. These widgets then
 	 * maintain the correct state and handle orderly shutdown.
 	 */
-	SND_SOC_DAPM_SUPPLY("DAC STM", ES8388_CHIPPOWER,
-			    ES8388_CHIPPOWER_DACSTM_RESET, 1, NULL, 0),
-	SND_SOC_DAPM_SUPPLY("DAC DIG", ES8388_CHIPPOWER,
-			    ES8388_CHIPPOWER_DACDIG_OFF, 1, NULL, 0),
-	SND_SOC_DAPM_SUPPLY("DAC DLL", ES8388_CHIPPOWER,
-			    ES8388_CHIPPOWER_DACDLL_OFF, 1, NULL, 0),
-	SND_SOC_DAPM_SUPPLY("DAC Vref", ES8388_CHIPPOWER,
-			    ES8388_CHIPPOWER_DACVREF_OFF, 1, NULL, 0),
+	/* R02 dependency chain: kept as NOPM for DAPM ordering only.
+	 * R02 is managed by set_bias_level (PREPARE writes 0x00,
+	 * OFF writes 0xFF). DAPM must not toggle R02 bits while
+	 * DAC+amp are always-on, or Vref shutdown causes pop. */
+	SND_SOC_DAPM_SUPPLY("DAC STM", SND_SOC_NOPM, 0, 0, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("DAC DIG", SND_SOC_NOPM, 0, 0, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("DAC DLL", SND_SOC_NOPM, 0, 0, NULL, 0),
+	SND_SOC_DAPM_SUPPLY("DAC Vref", SND_SOC_NOPM, 0, 0, NULL, 0),
 
-	/* R04[7:6]: DAC power - controlled automatically when stream opens/closes */
-	SND_SOC_DAPM_DAC("DACL", "Playback", ES8388_DACPOWER,
-			 ES8388_DACPOWER_LDAC_OFF, 1),
-	SND_SOC_DAPM_DAC("DACR", "Playback", ES8388_DACPOWER,
-			 ES8388_DACPOWER_RDAC_OFF, 1),
+        /* DAC: SND_SOC_NOPM - R04[7:6] managed by set_bias_level, not DAPM.
+	 * This avoids analog power transients (pop) on every play/stop. */
+	SND_SOC_DAPM_DAC("DACL", "Playback", SND_SOC_NOPM, 0, 0),
+	SND_SOC_DAPM_DAC("DACR", "Playback", SND_SOC_NOPM, 0, 0),
 
 	/* Mixer: no power register (SND_SOC_NOPM), routing only */
 	SND_SOC_DAPM_MIXER("Left Mixer", SND_SOC_NOPM, 0, 0,
@@ -317,23 +255,10 @@ static const struct snd_soc_dapm_widget es8388_dapm_widgets[] = {
 	SND_SOC_DAPM_MIXER("Right Mixer", SND_SOC_NOPM, 0, 0,
 			   es8388_right_mixer, ARRAY_SIZE(es8388_right_mixer)),
 
-	/* R04[5:4]: Output amplifier power */
-	//SND_SOC_DAPM_PGA("Left Out 1", ES8388_DACPOWER,
-	//		 ES8388_DACPOWER_LOUT1_ON, 0, NULL, 0),
-	//SND_SOC_DAPM_PGA("Right Out 1", ES8388_DACPOWER,
-	//		 ES8388_DACPOWER_ROUT1_ON, 0, NULL, 0),
-        SND_SOC_DAPM_PGA_E("Left Out 1", ES8388_DACPOWER,
-                           ES8388_DACPOWER_LOUT1_ON, 0, NULL, 0,
-                           es8388_out1_pga_event,
-                           SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
-                           SND_SOC_DAPM_PRE_PMD),
-
-        SND_SOC_DAPM_PGA_E("Right Out 1", ES8388_DACPOWER,
-                           ES8388_DACPOWER_ROUT1_ON, 0, NULL, 0,
-                           es8388_out1_pga_event,
-                           SND_SOC_DAPM_PRE_PMU | SND_SOC_DAPM_POST_PMU |
-                           SND_SOC_DAPM_PRE_PMD),
-
+        /* Output amp: SND_SOC_NOPM - R04[5:4] managed by set_bias_level.
+	 * Same reason as DAC: avoid analog pop on play/stop. */
+	SND_SOC_DAPM_PGA("Left Out 1", SND_SOC_NOPM, 0, 0, NULL, 0),
+	SND_SOC_DAPM_PGA("Right Out 1", SND_SOC_NOPM, 0, 0, NULL, 0),
 
 	/* Physical output pins */
 	SND_SOC_DAPM_OUTPUT("LOUT1"),
@@ -443,12 +368,41 @@ static int tom_es8388_hw_params(struct snd_pcm_substream *substream,
 
 static int tom_es8388_mute(struct snd_soc_dai *dai, int mute, int direction)
 {
-    if (direction != SNDRV_PCM_STREAM_PLAYBACK)
-        return 0;
+        struct snd_soc_component *c = dai->component;
+	struct es8388_priv *priv = snd_soc_component_get_drvdata(c);
 
-    return snd_soc_component_update_bits(dai->component, ES8388_DACCONTROL3,
-                                         ES8388_DACCONTROL3_DACMUTE,
-                                         mute ? ES8388_DACCONTROL3_DACMUTE : 0);
+        if (direction != SNDRV_PCM_STREAM_PLAYBACK)
+		return 0;
+
+	if (mute) {
+		/* Save DAC digital volume, then ramp to silence via R1A/R1B.
+		 * R1A/R1B have hardware soft ramp (R19[5]=1): the chip
+		 * internally ramps gain smoothly over multiple LRCK cycles.
+		 * 0xC0 = -96dB (effectively silent). */
+		priv->dac_lvol = snd_soc_component_read(c, ES8388_LDACVOL);
+		priv->dac_rvol = snd_soc_component_read(c, ES8388_RDACVOL);	
+                snd_soc_component_write(c, ES8388_LDACVOL, 0xC0);
+		snd_soc_component_write(c, ES8388_RDACVOL, 0xC0);
+                msleep(20);
+
+		snd_soc_component_update_bits(c, ES8388_DACCONTROL3,
+					      ES8388_DACCONTROL3_DACMUTE,
+					      ES8388_DACCONTROL3_DACMUTE);
+	} else {
+                /* Unmute with DAC volume at silence, then ramp up.
+		 * Hardware soft ramp smoothly transitions to target. */
+		snd_soc_component_write(c, ES8388_LDACVOL, 0xC0);
+		snd_soc_component_write(c, ES8388_RDACVOL, 0xC0);
+
+		snd_soc_component_update_bits(c, ES8388_DACCONTROL3,
+					      ES8388_DACCONTROL3_DACMUTE, 0);
+		msleep(5);
+
+	        snd_soc_component_write(c, ES8388_LDACVOL, priv->dac_lvol);
+		snd_soc_component_write(c, ES8388_RDACVOL, priv->dac_rvol);
+        }
+
+	return 0;
 }
 
 static const struct snd_soc_dai_ops tom_es8388_dai_ops = {
@@ -495,10 +449,13 @@ static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 		break;
 
 	case SND_SOC_BIAS_PREPARE:
-		/* R02: Force all chip power blocks on atomically.
-		 * This provides a clean baseline before DAPM widgets
-		 * individually manage their R02 bits. */
-		snd_soc_component_write(component, ES8388_CHIPPOWER, 0);
+		/* VREF, VMID=2x50k, digital enabled */
+                snd_soc_component_write(component, ES8388_CHIPPOWER, 0);
+                snd_soc_component_update_bits(component, ES8388_CONTROL1,
+				ES8388_CONTROL1_VMIDSEL_MASK |
+				ES8388_CONTROL1_ENREF,
+				ES8388_CONTROL1_VMIDSEL_50k |
+				ES8388_CONTROL1_ENREF);
 		break;
 
 	case SND_SOC_BIAS_STANDBY:
@@ -511,17 +468,43 @@ static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 					ES8388_CONTROL1_VMIDSEL_5k |
 					ES8388_CONTROL1_ENREF);
 			msleep(100);
+                        /* Power on DAC + output amp once. DAC is muted
+			 * (R19[2]=1 from reg_defaults), so no sound leaks.
+			 * R04 stays at 0x30 until BIAS_OFF (suspend). */
+			snd_soc_component_write(component, ES8388_DACPOWER,
+					0x30);
+			msleep(50);
 		}
 
-		/* R00: VMID=50k (low power standby), keep reference on */
-		snd_soc_component_update_bits(component, ES8388_CONTROL1,
+		/* R01: Enable overcurrent + thermal protection */
+		snd_soc_component_write(component, ES8388_CONTROL2,
+				ES8388_CONTROL2_OVERCURRENT |
+				ES8388_CONTROL2_THERMAL);
+
+                /* VREF, VMID=2*50k — same as PREPARE.
+		 * Keeping VMID at 50k avoids a bias voltage transient
+		 * when transitioning STANDBY<->PREPARE while the output
+		 * amplifier is always-on. Trade-off: ~1mA more idle. */
+                snd_soc_component_update_bits(component, ES8388_CONTROL1,
 				ES8388_CONTROL1_VMIDSEL_MASK |
 				ES8388_CONTROL1_ENREF,
-				ES8388_CONTROL1_VMIDSEL_500k |
+				ES8388_CONTROL1_VMIDSEL_50k |
 				ES8388_CONTROL1_ENREF);
 		break;
 
 	case SND_SOC_BIAS_OFF:
+                /* Power down digital blocks first, then analog.
+		 * R02=0xFF disables DAC digital (Vref/DLL/STM/DIG).
+		 * R04=0xC0 then powers off DAC + output amp.
+		 * Order matters: digital off before analog off. */
+		snd_soc_component_write(component, ES8388_CHIPPOWER, 0xFF);
+                /* Power off DAC + output amp (only reached on suspend) */
+		snd_soc_component_write(component, ES8388_DACPOWER, 0xC0);
+
+                snd_soc_component_update_bits(component, ES8388_CONTROL1,
+				ES8388_CONTROL1_VMIDSEL_MASK |
+				ES8388_CONTROL1_ENREF,
+				0);
 		break;
 	}
 
@@ -562,6 +545,13 @@ static int es8388_component_probe(struct snd_soc_component *component)
             dev_err(dev, "failed to sync regcache: %d\n", ret);
             goto sync_fail;
         }
+
+	/* Init DAC volume cache for mute ramp (R1A/R1B: 0x00 = 0dB) */
+	priv->dac_lvol = 0x00;
+	priv->dac_rvol = 0x00;
+
+        snd_soc_component_update_bits(component, 0x27, 0x80, 0x80);  /* Left mixer on */
+        snd_soc_component_update_bits(component, 0x2A, 0x80, 0x80);  /* Right mixer on */
 
 	return 0;
 
