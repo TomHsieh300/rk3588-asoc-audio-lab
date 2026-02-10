@@ -1,45 +1,35 @@
 // SPDX-License-Identifier: GPL-2.0-only
 /*
- * tom-es8388.c  --  ES8388 ALSA SoC Audio driver (practice)
+ * tom-es8388.c  --  ES8388 ALSA SoC Audio driver (practice, DAC-only)
  *
  * Author: Tom Hsieh <hungen3108@gmail.com>
  *
- * === Design Principles (matching upstream es8328.c) ===
+ * === Always-On Anti-Pop Architecture ===
  *
- * 1. hw_params: ONLY handles PCM-data-related registers
- *    - Word length (R17 DACCONTROL1)
- *    - MCLK/LRCK ratio (R18 DACCONTROL2)
- *    - Does NOT touch power, volume, or routing
+ * This driver differs from upstream es8328.c in one key way: all analog
+ * power blocks (R02, R04, R27/R2A) stay on between play and stop.
+ * Only the DAC mute bit (R19[2]) toggles. This eliminates pop noise
+ * caused by analog power state changes during play/stop transitions.
  *
- * 2. set_bias_level: Handles chip-level analog power
- *    - R00 (CONTROL1): VMID, EnRef
- *    - R01 (CONTROL2): overcurrent, thermal
- *    - R02 (CHIPPOWER): force all-on in PREPARE as clean baseline
+ * Trade-off: ~4-5mA idle current vs pop-free operation.
  *
- * 3. DAPM widgets: Handle signal-path power on/off
- *    - R02 bits via SUPPLY widgets (DAC STM/DIG/DLL/Vref)
- *    - R04 bits via DAC/PGA widgets (DACL/R, LOUT1/ROUT1)
- *    - Mixer routing switches (R27[7], R2A[7])
+ * Register ownership:
  *
- * 4. kcontrols: Handle user-adjustable parameters
- *    - PCM digital volume (R1A/R1B)
- *    - Output amplifier volume (R2E/R2F)
- *    - Exposed to userspace via ALSA mixer / Android AudioHAL
+ *   set_bias_level:  R00 (VMID), R01 (protection), R02 (digital power),
+ *                    R04 (DAC + output amp)
+ *   reg_defaults:    R19 (mute/ramp), R1C (clickfree), R2D (VROI),
+ *                    R27/R2A (mixer always-on), R2E/R2F (output PGA)
+ *   mute_stream:     R19[2] (DAC mute bit only)
+ *   kcontrols:       R1A/R1B (DAC digital volume), R2E/R2F (output PGA)
+ *   hw_params:       R17 (word length), R18 (MCLK ratio)
+ *   DAPM widgets:    All SND_SOC_NOPM (routing graph only, no register I/O)
  *
- * === Why R02=0 in PREPARE? ===
+ * Power state transitions:
  *
- * DAPM SUPPLY widgets control individual bits of R02 via read-modify-write.
- * During power-up, they execute sequentially:
- *   DAC Vref clears bit0 -> DAC DLL clears bit2 -> DAC STM clears bit4 -> ...
- *
- * Each intermediate state has some power blocks on and others off, which
- * can cause pop noise or unstable behavior. Writing R02=0x00 in PREPARE
- * ensures ALL chip power blocks are enabled atomically before DAPM acts.
- *
- * On the shutdown path (ON->PREPARE->STANDBY), PREPARE also writes R02=0,
- * but DAPM immediately powers down widgets afterward. The brief all-on
- * window is ~1 I2C transaction (~100us), far shorter than the IC's internal
- * settling time, so it causes no audible effect.
+ *   Boot:    OFF -> STANDBY: 5k charge(100ms) -> R04=0x30(50ms) -> 50k
+ *   Play:    STANDBY -> PREPARE -> ON: R02=0x00, VMID stays 50k
+ *   Stop:    ON -> PREPARE -> STANDBY: mute R19[2], VMID stays 50k
+ *   Suspend: STANDBY -> OFF: R02=0xFF -> R04=0xC0 -> VMID off
  */
 
 #include <linux/module.h>
@@ -142,34 +132,33 @@ struct es8388_priv {
 	struct regmap *regmap;
 	struct clk *clk;
 	struct regulator_bulk_data supplies[ES8388_SUPPLY_NUM];
-        unsigned int dac_lvol;   /* cached LDACVOL (R1A) for mute ramp */
-	unsigned int dac_rvol;   /* cached RDACVOL (R1B) for mute ramp */
 };
 
 /*
- * reg_defaults: Only registers that are NOT controlled by DAPM or kcontrols.
+ * reg_defaults: Initial register values written by regcache_sync in probe.
  *
- * Key change: Removed R27, R2A, R2E, R2F from defaults.
- * - R27[7]/R2A[7] (mixer switches) are controlled by DAPM mixer widgets
- * - R2E/R2F (output volume) are controlled by kcontrols
- * - R1A/R1B (DAC digital volume) are controlled by kcontrols
- * Having them in reg_defaults causes conflicts: regcache_sync can overwrite
- * values that DAPM/kcontrol have already set to a different state.
+ *
+ * These configure chip features that differ from ES8388 IC power-on defaults
+ * and are not dynamically managed by DAPM, bias_level, or mute_stream.
+ * R1A/R1B (DAC digital volume) are omitted because they are owned by the
+ * "PCM Volume" kcontrol; regcache_sync would overwrite user settings.
  */
 static const struct reg_default es8388_reg_defaults[] = {
-	{ 0x00, 0x05 },  /* CONTROL1: VMIDSEL=500k, EnRef */
+	{ 0x00, 0x05 },  /* CONTROL1: VMIDSEL=50k, EnRef */
 	{ 0x01, 0xC0 },  /* CONTROL2: overcurrent + thermal shutdown */
 	{ 0x02, 0x00 },  /* CHIPPOWER: all powered on */
-	{ 0x04, 0xC0 },  /* DACPOWER: DAC off, outputs off (DAPM controls) */
+	{ 0x04, 0xC0 },  /* DACPOWER: DAC off, outputs off (bias_level manages) */
 	{ 0x17, 0x18 },  /* DACCONTROL1: I2S, 16-bit */
 	{ 0x18, 0x02 },  /* DACCONTROL2: MCLK/LRCK = 256 */
-        { 0x2D, 0x10 },  /* DACCONTROL23: VROI=40k (slow discharge = no stop pop) */
-        { ES8388_DACCONTROL3, 0x26 | ES8388_DACCONTROL3_RAMPRATE_128LRCK },
-        { ES8388_DACCONTROL6, ES8388_DACCONTROL6_CLICKFREE }, /* 0x08 */
-        { ES8388_LOUT1VOL, 0x1E },   /* LOUT1: 0dB (volume ramp target) */
-        { ES8388_ROUT1VOL, 0x1E },   /* ROUT1: 0dB (volume ramp target) */
-        { ES8388_DACCONTROL17, 0xB8 },  /* bit7=1: Left DAC → Left Mixer */
-	{ ES8388_DACCONTROL20, 0xB8 },  /* bit7=1: Right DAC → Right Mixer */
+        { 0x2D, 0x10 },  /* DACCONTROL23: VROI=40k (slow discharge, less stop pop) */
+	{ ES8388_DACCONTROL3, 0x26 },  /* DAC muted, soft ramp on, 4 LRCK/step */
+	{ ES8388_DACCONTROL6, ES8388_DACCONTROL6_CLICKFREE },
+	{ ES8388_LOUT1VOL, 0x1E },    /* LOUT1: 0dB */
+	{ ES8388_ROUT1VOL, 0x1E },    /* ROUT1: 0dB */
+	/* Mixer: DAC-to-output always on. DAPM switch is NOPM (no register I/O),
+	 * so regcache_sync sets the initial routing state instead. */
+	{ ES8388_DACCONTROL17, 0xB8 }, /* bit7=1: Left DAC -> Left Mixer */
+	{ ES8388_DACCONTROL20, 0xB8 }, /* bit7=1: Right DAC -> Right Mixer */
 };
 
 static const struct regmap_config es8388_regmap_config = {
@@ -213,12 +202,9 @@ static const struct snd_kcontrol_new es8388_snd_controls[] = {
 
 /* ========== DAPM (Dynamic Audio Power Management) ========== */
 
-/* Mixer switch controls - these go INSIDE the DAPM mixer widgets.
- * DAPM will automatically power the mixer path on/off based on whether
- * there is a complete route from a source (Playback stream) to a sink (LOUT1/ROUT1).
- *
- * Unlike the kcontrols above, these are binary on/off switches for signal routing,
- * not user-adjustable volume knobs. */
+/* Mixer switch controls: SND_SOC_NOPM — routing graph only, no register I/O.
+ * R27[7]/R2A[7] are set permanently via reg_defaults. DAPM uses these
+ * switches for path discovery but never writes hardware. */
 static const struct snd_kcontrol_new es8388_left_mixer[] = {
 	SOC_DAPM_SINGLE("Playback Switch", SND_SOC_NOPM, 0, 1, 0),
 };
@@ -228,38 +214,26 @@ static const struct snd_kcontrol_new es8388_right_mixer[] = {
 };
 
 static const struct snd_soc_dapm_widget es8388_dapm_widgets[] = {
-	/*
-	 * R02 SUPPLY widgets: chip-level power blocks.
-	 * These establish DAPM dependencies so that the DAC digital block
-	 * won't power up until its prerequisites (STM, Vref, DLL) are ready.
-	 *
-	 * Note: set_bias_level(PREPARE) writes R02=0x00 BEFORE these widgets
-	 * act, ensuring no intermediate power states. These widgets then
-	 * maintain the correct state and handle orderly shutdown.
-	 */
-	/* R02 dependency chain: kept as NOPM for DAPM ordering only.
-	 * R02 is managed by set_bias_level (PREPARE writes 0x00,
-	 * OFF writes 0xFF). DAPM must not toggle R02 bits while
-	 * DAC+amp are always-on, or Vref shutdown causes pop. */
-	SND_SOC_DAPM_SUPPLY("DAC STM", SND_SOC_NOPM, 0, 0, NULL, 0),
+	/* R02 dependency chain: all NOPM. These exist only for DAPM graph
+	 * ordering (DIG depends on STM + Vref + DLL). R02 is managed
+	 * entirely by set_bias_level: PREPARE writes 0x00, OFF writes 0xFF. */
+        SND_SOC_DAPM_SUPPLY("DAC STM", SND_SOC_NOPM, 0, 0, NULL, 0),
 	SND_SOC_DAPM_SUPPLY("DAC DIG", SND_SOC_NOPM, 0, 0, NULL, 0),
 	SND_SOC_DAPM_SUPPLY("DAC DLL", SND_SOC_NOPM, 0, 0, NULL, 0),
 	SND_SOC_DAPM_SUPPLY("DAC Vref", SND_SOC_NOPM, 0, 0, NULL, 0),
 
-        /* DAC: SND_SOC_NOPM - R04[7:6] managed by set_bias_level, not DAPM.
-	 * This avoids analog power transients (pop) on every play/stop. */
-	SND_SOC_DAPM_DAC("DACL", "Playback", SND_SOC_NOPM, 0, 0),
+	/* DAC: NOPM. R04[7:6] managed by set_bias_level, not DAPM. */
+        SND_SOC_DAPM_DAC("DACL", "Playback", SND_SOC_NOPM, 0, 0),
 	SND_SOC_DAPM_DAC("DACR", "Playback", SND_SOC_NOPM, 0, 0),
 
-	/* Mixer: no power register (SND_SOC_NOPM), routing only */
-	SND_SOC_DAPM_MIXER("Left Mixer", SND_SOC_NOPM, 0, 0,
+	/* Mixer: NOPM. R27[7]/R2A[7] set via reg_defaults, not DAPM. */
+        SND_SOC_DAPM_MIXER("Left Mixer", SND_SOC_NOPM, 0, 0,
 			   es8388_left_mixer, ARRAY_SIZE(es8388_left_mixer)),
 	SND_SOC_DAPM_MIXER("Right Mixer", SND_SOC_NOPM, 0, 0,
 			   es8388_right_mixer, ARRAY_SIZE(es8388_right_mixer)),
 
-        /* Output amp: SND_SOC_NOPM - R04[5:4] managed by set_bias_level.
-	 * Same reason as DAC: avoid analog pop on play/stop. */
-	SND_SOC_DAPM_PGA("Left Out 1", SND_SOC_NOPM, 0, 0, NULL, 0),
+	/* Output amp: NOPM. R04[5:4] managed by set_bias_level. */
+        SND_SOC_DAPM_PGA("Left Out 1", SND_SOC_NOPM, 0, 0, NULL, 0),
 	SND_SOC_DAPM_PGA("Right Out 1", SND_SOC_NOPM, 0, 0, NULL, 0),
 
 	/* Physical output pins */
@@ -371,40 +345,18 @@ static int tom_es8388_hw_params(struct snd_pcm_substream *substream,
 static int tom_es8388_mute(struct snd_soc_dai *dai, int mute, int direction)
 {
         struct snd_soc_component *c = dai->component;
-	struct es8388_priv *priv = snd_soc_component_get_drvdata(c);
 
         if (direction != SNDRV_PCM_STREAM_PLAYBACK)
 		return 0;
 
-	if (mute) {
-		/* Save DAC digital volume, then ramp to silence via R1A/R1B.
-		 * R1A/R1B have hardware soft ramp (R19[5]=1): the chip
-		 * internally ramps gain smoothly over multiple LRCK cycles.
-		 * 0xC0 = -96dB (effectively silent). */
-		priv->dac_lvol = snd_soc_component_read(c, ES8388_LDACVOL);
-		priv->dac_rvol = snd_soc_component_read(c, ES8388_RDACVOL);	
-                snd_soc_component_write(c, ES8388_LDACVOL, 0xC0);
-		snd_soc_component_write(c, ES8388_RDACVOL, 0xC0);
-                msleep(20);
-
-		snd_soc_component_update_bits(c, ES8388_DACCONTROL3,
-					      ES8388_DACCONTROL3_DACMUTE,
-					      ES8388_DACCONTROL3_DACMUTE);
-	} else {
-                /* Unmute with DAC volume at silence, then ramp up.
-		 * Hardware soft ramp smoothly transitions to target. */
-		snd_soc_component_write(c, ES8388_LDACVOL, 0xC0);
-		snd_soc_component_write(c, ES8388_RDACVOL, 0xC0);
-
-		snd_soc_component_update_bits(c, ES8388_DACCONTROL3,
-					      ES8388_DACCONTROL3_DACMUTE, 0);
-		msleep(5);
-
-	        snd_soc_component_write(c, ES8388_LDACVOL, priv->dac_lvol);
-		snd_soc_component_write(c, ES8388_RDACVOL, priv->dac_rvol);
-        }
-
-	return 0;
+        /* Only toggle DAC mute bit (R19[2]). Do NOT touch R1A/R1B here —
+	 * those are owned by the "PCM Volume" kcontrol. Writing them from
+	 * mute_stream would corrupt the regmap cache and cause tinymix to
+	 * show volume=0 while stopped. Hardware soft ramp (R19[5]) smooths
+	 * the mute/unmute transition internally. */
+	return snd_soc_component_update_bits(c, ES8388_DACCONTROL3,
+					     ES8388_DACCONTROL3_DACMUTE,
+					     mute ? ES8388_DACCONTROL3_DACMUTE : 0);
 }
 
 static const struct snd_soc_dai_ops tom_es8388_dai_ops = {
@@ -431,17 +383,17 @@ static struct snd_soc_dai_driver es8388_dai = {
 /* ========== Bias Level (chip-level analog power) ========== */
 
 /*
- * Bias level controls the chip's analog reference and VMID.
- * This is separate from the signal-path power managed by DAPM.
+ * Bias level controls the chip's analog reference, VMID, and in our
+ * always-on design, also R02 (digital power) and R04 (DAC + output amp).
  *
- * Transition sequence during playback:
- *   Boot:   -> OFF -> STANDBY (idle_bias_on)
- *   Play:   STANDBY -> PREPARE -> ON
- *   Pause:  ON -> PREPARE -> STANDBY (after use_pmdown_time)
- *   Play:   STANDBY -> PREPARE -> ON
+ * VMID stays at 50k in both STANDBY and PREPARE to avoid bias voltage
+ * transients while the output amp is always-on.
  *
- * R02 is written to 0x00 in PREPARE to provide a deterministic starting
- * point before DAPM widgets act. See file header comment for details.
+ * Transition sequence:
+ *   Boot:    OFF -> STANDBY: 5k charge -> R04=0x30 -> 50k
+ *   Play:    STANDBY(50k) -> PREPARE(50k): R02=0x00, no VMID change
+ *   Stop:    PREPARE(50k) -> STANDBY(50k): no change (mute_stream handles R19)
+ *   Suspend: STANDBY -> OFF: R02=0xFF -> R04=0xC0 -> VMID off
  */
 static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 				     enum snd_soc_bias_level level)
@@ -547,10 +499,6 @@ static int es8388_component_probe(struct snd_soc_component *component)
             dev_err(dev, "failed to sync regcache: %d\n", ret);
             goto sync_fail;
         }
-
-	/* Init DAC volume cache for mute ramp (R1A/R1B: 0x00 = 0dB) */
-	priv->dac_lvol = 0x00;
-	priv->dac_rvol = 0x00;
 
 	return 0;
 
@@ -679,6 +627,6 @@ static struct i2c_driver es8388_driver = {
 
 module_i2c_driver(es8388_driver);
 
-MODULE_DESCRIPTION("Tom ES8388 ALSA SoC audio driver (practice)");
+MODULE_DESCRIPTION("Tom ES8388 ALSA SoC audio driver (practice, DAC-only)");
 MODULE_AUTHOR("Tom Hsieh <hungen3108@gmail.com>");
 MODULE_LICENSE("GPL");
