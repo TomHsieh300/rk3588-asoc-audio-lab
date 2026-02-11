@@ -151,6 +151,8 @@ static const struct reg_default es8388_reg_defaults[] = {
 	{ ES8388_DACCONTROL6, ES8388_DACCONTROL6_CLICKFREE },
 	{ ES8388_LOUT1VOL, 0x1C },    /* LOUT1: -3dB */
 	{ ES8388_ROUT1VOL, 0x1C },    /* ROUT1: -3dB */
+        { ES8388_DACCONTROL17, 0xB8 },  /* LD2LO=1: Left DAC → Left Mixer */
+	{ ES8388_DACCONTROL20, 0xB8 },  /* RD2RO=1: Right DAC → Right Mixer */
 };
 
 static const struct regmap_config es8388_regmap_config = {
