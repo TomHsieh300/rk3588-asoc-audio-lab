@@ -166,6 +166,7 @@ static const char * const es8388_supply_names[ES8388_SUPPLY_NUM] = {
 struct es8388_priv {
 	struct regmap *regmap;
 	struct clk *clk;
+        unsigned int sysclk; /* Store MCLK frequency */
 	struct regulator_bulk_data supplies[ES8388_SUPPLY_NUM];
 };
 
@@ -318,18 +319,29 @@ static int tom_es8388_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 {
 	struct snd_soc_component *component = dai->component;
 	int ret;
+        u8 msc = 0;
 
+        /* 1. Configure Master/Slave mode based on Clock Provider mask */
 	switch (fmt & SND_SOC_DAIFMT_CLOCK_PROVIDER_MASK) {
-	case SND_SOC_DAIFMT_CBC_CFC:
-		ret = es8388_update_bits(component, ES8388_MASTERMODE,
-					 ES8388_MASTERMODE_MSC, 0);
-		if (ret)
-			return ret;
+        case SND_SOC_DAIFMT_CBP_CFP:
+		/* Codec is Master: Generates BCLK and LRCK */
+		msc = ES8388_MASTERMODE_MSC;
 		break;
+	case SND_SOC_DAIFMT_CBC_CFC:
+		/* Codec is Slave: Receives BCLK and LRCK from SoC */
+		msc = 0;
+                break;
 	default:
+                dev_err(component->dev, "Unsupported DAI format mask\n");
 		return -EINVAL;
 	}
 
+        ret = es8388_update_bits(component, ES8388_MASTERMODE,
+				 ES8388_MASTERMODE_MSC, msc);
+	if (ret)
+		return ret;
+
+	/* 2. Configure Digital Interface Format */
 	switch (fmt & SND_SOC_DAIFMT_FORMAT_MASK) {
 	case SND_SOC_DAIFMT_I2S:
 		ret = es8388_update_bits(component, ES8388_DACCONTROL1,
@@ -347,13 +359,54 @@ static int tom_es8388_set_dai_fmt(struct snd_soc_dai *dai, unsigned int fmt)
 	return 0;
 }
 
+static int tom_es8388_set_sysclk(struct snd_soc_dai *dai,
+				 int clk_id, unsigned int freq, int dir)
+{
+	struct snd_soc_component *component = dai->component;
+	struct es8388_priv *priv = snd_soc_component_get_drvdata(component);
+
+	priv->sysclk = freq;
+	return 0;
+}
+
 static int tom_es8388_hw_params(struct snd_pcm_substream *substream,
 				struct snd_pcm_hw_params *params,
 				struct snd_soc_dai *dai)
 {
 	struct snd_soc_component *component = dai->component;
-	int wl, ret;
+	struct es8388_priv *priv = snd_soc_component_get_drvdata(component);
+	int wl, ret, ratio;
+	int rate = params_rate(params);
 
+	/* 1. Calculate MCLK/LRCK ratio */
+	if (priv->sysclk) {
+		ratio = priv->sysclk / rate;
+	} else {
+		dev_err(component->dev, "MCLK frequency not set\n");
+		return -EINVAL;
+	}
+
+	/* 2. Map ratio to R18 value (refer to ES8388 datasheet)
+	 * 0: 256, 1: 384, 2: 512, 3: 768, 4: 1024, etc.
+	 */
+	switch (ratio) {
+	case 256:  ret = 0; break;
+	case 384:  ret = 1; break;
+	case 512:  ret = 2; break;
+	case 768:  ret = 3; break;
+	case 1024: ret = 4; break;
+	default:
+		dev_err(component->dev, "Unsupported MCLK/LRCK ratio: %d\n", ratio);
+		return -EINVAL;
+	}
+
+	/* Update R18 with the explicit ratio */
+	ret = es8388_update_bits(component, ES8388_DACCONTROL2,
+				 ES8388_DACCONTROL2_RATEMASK, ret);
+	if (ret)
+		return ret;
+
+	/* 3. Set Word Length */
 	switch (params_width(params)) {
 	case 16:
 		wl = 3;
@@ -377,12 +430,6 @@ static int tom_es8388_hw_params(struct snd_pcm_substream *substream,
 	ret = es8388_update_bits(component, ES8388_DACCONTROL1,
 				 ES8388_DACCONTROL1_DACWL_MASK,
 				 wl << ES8388_DACCONTROL1_DACWL_SHIFT);
-	if (ret)
-		return ret;
-
-	/* Slave mode auto-detects MCLK/LRCK ratio */
-	ret = es8388_update_bits(component, ES8388_DACCONTROL2,
-				 ES8388_DACCONTROL2_RATEMASK, 0);
 	if (ret)
 		return ret;
 
@@ -411,7 +458,8 @@ static const struct snd_soc_dai_ops tom_es8388_dai_ops = {
 	.set_fmt	= tom_es8388_set_dai_fmt,
 	.hw_params	= tom_es8388_hw_params,
 	.mute_stream	= tom_es8388_mute,
-	.no_capture_mute = 1,
+	.set_sysclk	= tom_es8388_set_sysclk,
+        .no_capture_mute = 1,
 };
 
 static struct snd_soc_dai_driver es8388_dai = {
