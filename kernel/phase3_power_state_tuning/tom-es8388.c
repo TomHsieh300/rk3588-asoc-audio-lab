@@ -144,10 +144,6 @@ struct es8388_priv {
  * "PCM Volume" kcontrol; regcache_sync would overwrite user settings.
  */
 static const struct reg_default es8388_reg_defaults[] = {
-	{ 0x00, 0x05 },  /* CONTROL1: VMIDSEL=50k, EnRef */
-	{ 0x01, 0xC0 },  /* CONTROL2: overcurrent + thermal shutdown */
-	{ 0x02, 0x00 },  /* CHIPPOWER: all powered on */
-	{ 0x04, 0xC0 },  /* DACPOWER: DAC off, outputs off (bias_level manages) */
 	{ 0x17, 0x18 },  /* DACCONTROL1: I2S, 16-bit */
 	{ 0x18, 0x02 },  /* DACCONTROL2: MCLK/LRCK = 256 */
         { 0x2D, 0x10 },  /* DACCONTROL23: VROI=40k (slow discharge, less stop pop) */
@@ -155,10 +151,6 @@ static const struct reg_default es8388_reg_defaults[] = {
 	{ ES8388_DACCONTROL6, ES8388_DACCONTROL6_CLICKFREE },
 	{ ES8388_LOUT1VOL, 0x1C },    /* LOUT1: -3dB */
 	{ ES8388_ROUT1VOL, 0x1C },    /* ROUT1: -3dB */
-	/* Mixer: DAC-to-output always on. DAPM switch is NOPM (no register I/O),
-	 * so regcache_sync sets the initial routing state instead. */
-	{ ES8388_DACCONTROL17, 0xB8 }, /* bit7=1: Left DAC -> Left Mixer */
-	{ ES8388_DACCONTROL20, 0xB8 }, /* bit7=1: Right DAC -> Right Mixer */
 };
 
 static const struct regmap_config es8388_regmap_config = {
@@ -206,11 +198,11 @@ static const struct snd_kcontrol_new es8388_snd_controls[] = {
  * R27[7]/R2A[7] are set permanently via reg_defaults. DAPM uses these
  * switches for path discovery but never writes hardware. */
 static const struct snd_kcontrol_new es8388_left_mixer[] = {
-	SOC_DAPM_SINGLE("Playback Switch", SND_SOC_NOPM, 0, 1, 0),
+	SOC_DAPM_SINGLE("Playback Switch", ES8388_DACCONTROL17, 7, 1, 0),
 };
 
 static const struct snd_kcontrol_new es8388_right_mixer[] = {
-	SOC_DAPM_SINGLE("Playback Switch", SND_SOC_NOPM, 0, 1, 0),
+	SOC_DAPM_SINGLE("Playback Switch", ES8388_DACCONTROL20, 7, 1, 0),
 };
 
 static const struct snd_soc_dapm_widget es8388_dapm_widgets[] = {
@@ -235,6 +227,8 @@ static const struct snd_soc_dapm_widget es8388_dapm_widgets[] = {
 	/* Output amp: NOPM. R04[5:4] managed by set_bias_level. */
         SND_SOC_DAPM_PGA("Left Out 1", SND_SOC_NOPM, 0, 0, NULL, 0),
 	SND_SOC_DAPM_PGA("Right Out 1", SND_SOC_NOPM, 0, 0, NULL, 0),
+        SND_SOC_DAPM_PGA("Left Out 2", SND_SOC_NOPM, 0, 0, NULL, 0),
+        SND_SOC_DAPM_PGA("Right Out 2", SND_SOC_NOPM, 0, 0, NULL, 0),
 
 	/* Physical output pins */
 	SND_SOC_DAPM_OUTPUT("LOUT1"),
@@ -262,6 +256,10 @@ static const struct snd_soc_dapm_route es8388_routes[] = {
 	{ "Right Out 1", NULL, "Right Mixer" },
 	{ "LOUT1", NULL, "Left Out 1" },
 	{ "ROUT1", NULL, "Right Out 1" },
+        { "Left Out 2",  NULL, "Left Mixer" },
+        { "Right Out 2", NULL, "Right Mixer" },
+        { "LOUT2", NULL, "Left Out 2" },
+        { "ROUT2", NULL, "Right Out 2" },
 };
 
 /* ========== DAI operations ========== */
