@@ -62,6 +62,7 @@ implement a full custom machine driver.
 - Removal of redundant DAPM delays
 - Faster playback startup
 - Stable unmute timing
+- Output gain headroom: default -3dB, max limited to avoid clipping on this board
 
 ---
 
