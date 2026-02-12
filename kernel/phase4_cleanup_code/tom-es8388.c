@@ -176,9 +176,6 @@ struct es8388_priv {
  * These configure chip features that differ from ES8388 IC power-on defaults
  * and are not dynamically managed by bias_level or mute_stream.
  *
- * NOTE: All volume registers MUST be in reg_defaults so that regcache_sync
- * can properly restore user-defined levels after a power cycle.
- *
  * Power registers (R00/R01/R02/R04) are NOT listed here — they are managed
  * exclusively by set_bias_level to ensure correct power sequencing.
  */
@@ -189,11 +186,11 @@ static const struct reg_default es8388_reg_defaults[] = {
 	{ ES8388_DACCONTROL6, ES8388_DACCONTROL6_CLICKFREE },
 	{ ES8388_DACCONTROL17, ES8388_MIXER_DAC_DEFAULT },
 	{ ES8388_DACCONTROL20, ES8388_MIXER_DAC_DEFAULT },
-        { ES8388_LDACVOL, 0xC0 }, // DAC Digital Max
-        { ES8388_RDACVOL, 0xC0 },
-	{ ES8388_LOUT1VOL, 0x1C },	/* -3dB (headroom for full-scale DAC) */
-	{ ES8388_ROUT1VOL, 0x1C },	/* -3dB */
-	{ ES8388_DACCONTROL23, ES8388_DACCONTROL23_VROI_40K },
+	{ ES8388_LDACVOL, 0xC0 },	/* -96dB (hardware POR default) */
+	{ ES8388_RDACVOL, 0xC0 },	/* -96dB (hardware POR default) */
+	{ ES8388_LOUT1VOL, 0x00 },	/* POR default (-45dB). Let userspace decide. */
+	{ ES8388_ROUT1VOL, 0x00 },	/* POR default (-45dB). Let userspace decide. */
+        { ES8388_DACCONTROL23, ES8388_DACCONTROL23_VROI_40K },
 };
 
 static const struct regmap_config es8388_regmap_config = {
@@ -375,34 +372,57 @@ static int tom_es8388_hw_params(struct snd_pcm_substream *substream,
 {
 	struct snd_soc_component *component = dai->component;
 	struct es8388_priv *priv = snd_soc_component_get_drvdata(component);
-	int wl, ret, ratio;
+	int wl, ret, ratio, ratio_val;
 	int rate = params_rate(params);
 
 	/* 1. Calculate MCLK/LRCK ratio */
-	if (priv->sysclk) {
-		ratio = priv->sysclk / rate;
-	} else {
+	if (!priv->sysclk) {
 		dev_err(component->dev, "MCLK frequency not set\n");
 		return -EINVAL;
 	}
 
-	/* 2. Map ratio to R18 value (refer to ES8388 datasheet)
-	 * 0: 256, 1: 384, 2: 512, 3: 768, 4: 1024, etc.
-	 */
-	switch (ratio) {
-	case 256:  ret = 0; break;
-	case 384:  ret = 1; break;
-	case 512:  ret = 2; break;
-	case 768:  ret = 3; break;
-	case 1024: ret = 4; break;
-	default:
+        ratio = priv->sysclk / rate;
+
+	/*
+	 * 2. Map ratio to DACFsRatio[4:0] in R18 (DAC Control 2).
+	 *    Encoding per ES8388 datasheet Section 6.3.2:
+	 *      0=128, 1=192, 2=256, 3=384, 4=512, 5=576, 6=768, 7=1024
+	 *    Single speed (8-50kHz):  256, 384, 512, 768, 1024
+	 *    Double speed (50-100kHz): 128, 192, 256, 384, 512
+         */
+        switch (ratio) {
+	case 128:
+		ratio_val = 0;
+		break;
+	case 192:
+		ratio_val = 1;
+		break;
+	case 256:
+		ratio_val = 2;
+		break;
+	case 384:
+		ratio_val = 3;
+		break;
+	case 512:
+		ratio_val = 4;
+		break;
+	case 576:
+		ratio_val = 5;
+		break;
+	case 768:
+		ratio_val = 6;
+		break;
+	case 1024:
+		ratio_val = 7;
+		break;
+        default:
 		dev_err(component->dev, "Unsupported MCLK/LRCK ratio: %d\n", ratio);
 		return -EINVAL;
 	}
 
 	/* Update R18 with the explicit ratio */
 	ret = es8388_update_bits(component, ES8388_DACCONTROL2,
-				 ES8388_DACCONTROL2_RATEMASK, ret);
+				 ES8388_DACCONTROL2_RATEMASK, ratio_val);
 	if (ret)
 		return ret;
 
@@ -481,7 +501,6 @@ static struct snd_soc_dai_driver es8388_dai = {
 static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 				     enum snd_soc_bias_level level)
 {
-        struct es8388_priv *priv = snd_soc_component_get_drvdata(component);
 	int ret;
 
 	switch (level) {
@@ -525,13 +544,6 @@ static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 			if (ret)
 				return ret;
 			msleep(ES8388_DACPOWER_SETTLE_MS);
-
-                        /*
-			 * [STABILITY FIX] Sync regcache here once VMID and DAC power 
-			 * are stable. Use priv->regmap directly to avoid undeclared 
-			 * function errors.
-			 */
-			regcache_sync(priv->regmap);
 		}
 
 		ret = es8388_write(component, ES8388_CONTROL2,
@@ -601,13 +613,24 @@ static int es8388_component_probe(struct snd_soc_component *component)
 		dev_err(dev, "failed to enable mclk: %d\n", ret);
 		goto clk_fail;
 	}
-/* Mark cache as dirty and defer sync to set_bias_level(STANDBY) */
+	/*
+	 * Sync config registers to hardware. These are digital registers
+	 * (R17-R2F) that only need I2C + DVDD — no analog power required.
+	 * Power sequencing (VMID, DAC amp) is handled by set_bias_level,
+	 * which the framework calls automatically after probe returns
+	 * (idle_bias_on = 1 → OFF→STANDBY transition).
+	 */
 	regcache_mark_dirty(priv->regmap);
-
-        snd_soc_component_force_bias_level(component, SND_SOC_BIAS_STANDBY);
+	ret = regcache_sync(priv->regmap);
+	if (ret) {
+		dev_err(dev, "regcache sync failed: %d\n", ret);
+		goto sync_fail;
+	}
 
 	return 0;
 
+sync_fail:
+	clk_disable_unprepare(priv->clk);
 clk_fail:
 	regulator_bulk_disable(ES8388_SUPPLY_NUM, priv->supplies);
 	return ret;
@@ -647,10 +670,18 @@ static int es8388_resume(struct snd_soc_component *component)
 		return ret;
 	}
 
-        /* Mark dirty and trigger bias transition to sync registers */
-	regcache_mark_dirty(priv->regmap);
+	/*
+	 * Restore cached register values to hardware after power cycle.
+	 * Framework handles OFF→STANDBY transition (suspend_bias_off = 1,
+	 * idle_bias_on = 1) after resume returns.
+	 */
+        regcache_mark_dirty(priv->regmap);
 
-        snd_soc_component_force_bias_level(component, SND_SOC_BIAS_STANDBY);
+	ret = regcache_sync(priv->regmap);
+	if (ret) {
+		dev_err(component->dev, "regcache sync failed: %d\n", ret);
+		return ret;
+	}
 
 	return 0;
 }
