@@ -15,7 +15,8 @@
  *
  * Register ownership:
  *
- *   set_bias_level:  R00 (VMID), R01 (protection), R02 (digital power),
+ *   set_bias_level:  R00 (VMID), R01 (protection),
+ *                    R02 (chip digital power — dacVref/DLL/STM),
  *                    R04 (DAC + output amp)
  *   reg_defaults:    R17/R18 (DAC format/rate), R19 (mute/ramp),
  *                    R1C (clickfree), R2D (VROI),
@@ -27,7 +28,9 @@
  *
  * Power state transitions:
  *
- *   Boot:    OFF -> STANDBY: 5k charge(100ms) -> R04 on(50ms) -> 50k
+ *   Boot:    OFF -> STANDBY: 5k charge(100ms)
+ *                            -> R02 on(50ms, dacVref settle)
+ *                            -> R04 on(50ms, output amp settle) -> 50k
  *   Play:    STANDBY -> PREPARE -> ON: R02=0x00, VMID stays 50k
  *   Stop:    ON -> PREPARE -> STANDBY: mute R19[2], VMID stays 50k
  *   Suspend: STANDBY -> OFF: R02=0xFF -> R04=0xC0 -> VMID off
@@ -55,6 +58,7 @@
 /* Timing constants (ms) */
 #define ES8388_VMID_CHARGE_MS		100	/* 5k fast charge duration */
 #define ES8388_DACPOWER_SETTLE_MS	50	/* DAC + output amp settle */
+#define ES8388_DACVREF_SETTLE_MS	50	/* dacVref stabilization */
 
 /* R00: Chip Control 1 */
 #define ES8388_CONTROL1			0x00
@@ -508,11 +512,15 @@ static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 		break;
 
 	case SND_SOC_BIAS_PREPARE:
-		ret = es8388_write(component, ES8388_CHIPPOWER,
-				   ES8388_CHIPPOWER_ALL_ON);
-		if (ret)
-			return ret;
-		ret = es8388_update_bits(component, ES8388_CONTROL1,
+		/*
+	         * R02 is already 0x00 from STANDBY. Do NOT write it here —
+	         * es8388_write() always sends I2C even when value unchanged,
+	         * which disturbs dacVref and causes intermittent pop noise.
+	         *
+	         * R00 uses update_bits (cache dedup) so it's safe — no I2C
+	         * write occurs when already at 50k.
+	         */
+                ret = es8388_update_bits(component, ES8388_CONTROL1,
 				ES8388_CONTROL1_VMIDSEL_MASK |
 				ES8388_CONTROL1_ENREF,
 				ES8388_CONTROL1_VMIDSEL_50k |
@@ -533,11 +541,24 @@ static int tom_es8388_set_bias_level(struct snd_soc_component *component,
 			if (ret)
 				return ret;
 			msleep(ES8388_VMID_CHARGE_MS);
+
+			/*
+			 * Enable DAC digital blocks + dacVref BEFORE the
+			 * output amp. dacVref charges its decoupling cap
+			 * here; the transient is invisible because R04 is
+			 * still 0xC0 (output amp off).
+			 */
+			ret = es8388_write(component, ES8388_CHIPPOWER,
+					   ES8388_CHIPPOWER_ALL_ON);
+			if (ret)
+				return ret;
+			msleep(ES8388_DACVREF_SETTLE_MS);
+
 			/*
 			 * Power on DAC + output amp. DAC is muted
 			 * (R19[2]=1 from reg_defaults), so no sound leaks.
-			 * R04 stays powered until BIAS_OFF (suspend).
-			 * TODO: change to 0x3C when LOUT2/ROUT2 hw connected.
+			 * R02/R04 stay powered until BIAS_OFF (suspend).
+                         * TODO: change to 0x3C when LOUT2/ROUT2 hw connected.
 			 */
 			ret = es8388_write(component, ES8388_DACPOWER,
 					   ES8388_DACPOWER_LOUT1_ROUT1);
