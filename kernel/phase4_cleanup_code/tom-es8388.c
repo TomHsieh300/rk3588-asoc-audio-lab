@@ -678,17 +678,22 @@ static int es8388_resume(struct snd_soc_component *component)
 	struct es8388_priv *priv = snd_soc_component_get_drvdata(component);
 	int ret;
 
-	ret = clk_prepare_enable(priv->clk);
-	if (ret) {
-		dev_err(component->dev, "unable to enable clock: %d\n", ret);
-		return ret;
-	}
-
+	/*
+	 * Power-on order must match probe: regulators first, then MCLK.
+	 * MCLK output pad requires stable I/O power domain before toggling;
+	 * enabling clock before regulators may cause glitches or I2C timeout
+	 * on some boards.
+	 */
 	ret = regulator_bulk_enable(ES8388_SUPPLY_NUM, priv->supplies);
 	if (ret) {
 		dev_err(component->dev, "unable to enable regulators: %d\n", ret);
-		clk_disable_unprepare(priv->clk);
 		return ret;
+	}
+
+	ret = clk_prepare_enable(priv->clk);
+	if (ret) {
+		dev_err(component->dev, "unable to enable clock: %d\n", ret);
+		goto err_clk;
 	}
 
 	/*
@@ -696,15 +701,21 @@ static int es8388_resume(struct snd_soc_component *component)
 	 * Framework handles OFF→STANDBY transition (suspend_bias_off = 1,
 	 * idle_bias_on = 1) after resume returns.
 	 */
-        regcache_mark_dirty(priv->regmap);
+	regcache_mark_dirty(priv->regmap);
 
 	ret = regcache_sync(priv->regmap);
 	if (ret) {
 		dev_err(component->dev, "regcache sync failed: %d\n", ret);
-		return ret;
+		goto err_sync;
 	}
 
 	return 0;
+
+err_sync:
+	clk_disable_unprepare(priv->clk);
+err_clk:
+	regulator_bulk_disable(ES8388_SUPPLY_NUM, priv->supplies);
+	return ret;
 }
 
 /* ========== Component driver ========== */

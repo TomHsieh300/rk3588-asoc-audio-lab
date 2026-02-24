@@ -531,29 +531,32 @@ static int es8388_resume(struct snd_soc_component *component)
 	struct regmap *regmap = dev_get_regmap(component->dev, NULL);
 	int ret;
 
-	ret = clk_prepare_enable(priv->clk);
-	if (ret) {
-		dev_err(component->dev, "unable to enable clock\n");
-		return ret;
-	}
-
 	ret = regulator_bulk_enable(ES8388_SUPPLY_NUM, priv->supplies);
 	if (ret) {
 		dev_err(component->dev, "unable to enable regulators\n");
-		clk_disable_unprepare(priv->clk);
 		return ret;
+	}
+
+	ret = clk_prepare_enable(priv->clk);
+	if (ret) {
+		dev_err(component->dev, "unable to enable clock\n");
+		goto err_clk;
 	}
 
 	regcache_mark_dirty(regmap);
 	ret = regcache_sync(regmap);
 	if (ret) {
 		dev_err(component->dev, "unable to sync regcache: %d\n", ret);
-                regulator_bulk_disable(ES8388_SUPPLY_NUM, priv->supplies);
-		clk_disable_unprepare(priv->clk);
-                return ret;
+		goto err_sync;
 	}
 
 	return 0;
+
+err_sync:
+	clk_disable_unprepare(priv->clk);
+err_clk:
+	regulator_bulk_disable(ES8388_SUPPLY_NUM, priv->supplies);
+	return ret;
 }
 
 /* ========== Component driver ========== */
